@@ -1,9 +1,8 @@
-
-import io
-import math
+import os
 import re
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+import math
+import tempfile
+from difflib import SequenceMatcher
 
 import pandas as pd
 import streamlit as st
@@ -13,607 +12,551 @@ try:
 except Exception:
     OpenAI = None
 
+st.set_page_config(page_title="Лемана Про — Юнит-экономика", layout="wide", page_icon="📦")
 
-st.set_page_config(page_title="Лемана Про — простая юнит-экономика", layout="wide", page_icon="📦")
+DEFAULT_RATES_PATHS = [
+    "lemanpro_rates.xlsx",
+    "data/lemanpro_rates.xlsx",
+    "Коммерческие комиссии (февраль) (3).xlsx",
+]
 
-
-# =========================
-# Helpers
-# =========================
-
-def clean_text(x) -> str:
-    if pd.isna(x):
-        return ""
-    return str(x).strip()
-
-
-def norm_text(x) -> str:
-    s = clean_text(x).lower().replace("ё", "е")
-    s = re.sub(r"[^a-zа-я0-9\s\-_/]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+STOPWORDS = {
+    "для", "и", "или", "в", "во", "на", "по", "с", "со", "из", "к", "от", "до", "под", "над",
+    "the", "and", "or", "of", "a", "an", "to", "with", "без", "под", "из", "за", "при", "над", "от"
+}
 
 
-def to_float(x, default=0.0) -> float:
-    if pd.isna(x):
-        return default
-    s = str(x).strip().replace(" ", "").replace("%", "").replace(",", ".")
-    if not s:
-        return default
+def normalize_text(text: str) -> str:
+    text = str(text or "").lower().strip()
+    text = text.replace("ё", "е")
+    text = re.sub(r"[_/\\|]+", " ", text)
+    text = re.sub(r"[^a-zа-я0-9\s-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+
+def tokenize(text: str):
+    tokens = re.findall(r"[a-zа-я0-9]+", normalize_text(text))
+    return [t for t in tokens if len(t) > 2 and t not in STOPWORDS]
+
+
+
+def safe_float(value, default=0.0):
     try:
-        return float(s)
+        if value is None or (isinstance(value, float) and math.isnan(value)):
+            return default
+        return float(str(value).replace(",", ".").strip())
     except Exception:
         return default
 
 
-def pick_col(df: pd.DataFrame, variants: List[str]) -> Optional[str]:
-    cols = {norm_text(c): c for c in df.columns}
-    for variant in variants:
-        key = norm_text(variant)
-        if key in cols:
-            return cols[key]
-    for c in df.columns:
-        c_norm = norm_text(c)
-        if any(norm_text(v) in c_norm for v in variants):
-            return c
+
+def normalize_dimension(value, unit: str):
+    v = safe_float(value, 0.0)
+    unit = str(unit).strip().lower()
+    if unit in ("мм", "mm"):
+        return v / 10.0
+    return v
+
+
+
+def normalize_weight(value, unit: str):
+    v = safe_float(value, 0.0)
+    unit = str(unit).strip().lower()
+    if unit in ("г", "gr", "g", "гр"):
+        return v / 1000.0
+    return v
+
+
+
+def find_existing_rates_file():
+    for path in DEFAULT_RATES_PATHS:
+        if os.path.exists(path):
+            return path
     return None
 
 
-def parse_range_text(text: str) -> Tuple[float, Optional[float]]:
-    s = norm_text(text).replace("л.", " л")
-    nums = re.findall(r"\d+(?:[.,]\d+)?", s.replace(",", "."))
-    if not nums:
-        return 0.0, None
-    vals = [float(x) for x in nums]
-    if len(vals) == 1:
-        return vals[0], None
-    lo, hi = vals[0], vals[1]
-    if hi < lo:
-        lo, hi = hi, lo
-    return lo, hi
+@st.cache_data(show_spinner=False)
+def load_standard_ratebook_from_path(path: str):
+    xls = pd.ExcelFile(path)
+    sheets = xls.sheet_names
+
+    required = {
+        "Комиссия_FBS и FBO",
+        "Тарифы (Последняя миля)",
+        "Тарифы (возврат Последняя миля)",
+        "Тарифы (Доставка до СЦ)",
+        "Тарифы (Возврат Доставка до СЦ)",
+    }
+    missing = required - set(sheets)
+    if missing:
+        raise ValueError(f"В файле не хватает листов: {', '.join(sorted(missing))}")
+
+    commission = pd.read_excel(path, sheet_name="Комиссия_FBS и FBO")
+    last_mile = pd.read_excel(path, sheet_name="Тарифы (Последняя миля)")
+    return_last_mile = pd.read_excel(path, sheet_name="Тарифы (возврат Последняя миля)")
+    to_sc = pd.read_excel(path, sheet_name="Тарифы (Доставка до СЦ)")
+    return_to_sc = pd.read_excel(path, sheet_name="Тарифы (Возврат Доставка до СЦ)")
+
+    commission = commission.rename(columns={
+        commission.columns[0]: "commission",
+        commission.columns[1]: "template",
+        commission.columns[2]: "type",
+        commission.columns[3]: "subcategory",
+        commission.columns[4]: "category",
+    }).copy()
+    commission["commission"] = pd.to_numeric(commission["commission"], errors="coerce").fillna(0.0)
+    for col in ["template", "type", "subcategory", "category"]:
+        commission[col] = commission[col].fillna("").astype(str)
+    commission["search_text"] = (
+        commission["template"] + " " + commission["type"] + " " + commission["subcategory"] + " " + commission["category"]
+    ).map(normalize_text)
+    commission["tokens"] = commission["search_text"].map(tokenize)
+
+    def prep_last_mile(df: pd.DataFrame):
+        df = df.rename(columns={
+            df.columns[0]: "zone_from",
+            df.columns[1]: "zone_to",
+            df.columns[2]: "break_text",
+            df.columns[4]: "base_tariff",
+            df.columns[5]: "per_liter",
+        }).copy()
+        df["zone_from"] = df["zone_from"].astype(str).str.strip()
+        df["zone_to"] = df["zone_to"].astype(str).str.strip()
+        df["base_tariff"] = pd.to_numeric(df["base_tariff"], errors="coerce").fillna(0.0)
+        df["per_liter"] = pd.to_numeric(df["per_liter"], errors="coerce").fillna(0.0)
+        bounds = df["break_text"].astype(str).str.extract(r"(\d+(?:[\.,]\d+)?)\s*до\s*(\d+(?:[\.,]\d+)?)")
+        df["break_from"] = bounds[0].str.replace(",", ".", regex=False).astype(float)
+        df["break_to"] = bounds[1].str.replace(",", ".", regex=False).astype(float)
+        return df
+
+    def prep_sc(df: pd.DataFrame):
+        df = df.rename(columns={
+            df.columns[0]: "break_text",
+            df.columns[1]: "base_tariff",
+        }).copy()
+        df["base_tariff"] = pd.to_numeric(df["base_tariff"], errors="coerce").fillna(0.0)
+        bounds = df["break_text"].astype(str).str.extract(r"(\d+(?:[\.,]\d+)?)\s*до\s*(\d+(?:[\.,]\d+)?)")
+        df["break_from"] = bounds[0].str.replace(",", ".", regex=False).astype(float)
+        df["break_to"] = bounds[1].str.replace(",", ".", regex=False).astype(float)
+        return df
+
+    return {
+        "commission": commission,
+        "last_mile": prep_last_mile(last_mile),
+        "return_last_mile": prep_last_mile(return_last_mile),
+        "to_sc": prep_sc(to_sc),
+        "return_to_sc": prep_sc(return_to_sc),
+        "source_path": path,
+    }
 
 
-def volume_l(length_cm: float, width_cm: float, height_cm: float) -> float:
-    return max(length_cm, 0) * max(width_cm, 0) * max(height_cm, 0) / 1000.0
+@st.cache_data(show_spinner=False)
+def load_standard_ratebook_from_bytes(file_bytes: bytes, file_name: str):
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    tmp.write(file_bytes)
+    tmp.flush()
+    tmp.close()
+    try:
+        return load_standard_ratebook_from_path(tmp.name)
+    finally:
+        pass
 
 
-def round_price(x: float, step: int) -> float:
-    if step <= 1:
-        return round(x, 2)
-    return math.ceil(x / step) * step
 
-
-# =========================
-# Tax model
-# =========================
-
-TAX_OPTIONS = {
-    "Без налога": ("none", 0.0),
-    "УСН Доходы 6%": ("revenue", 0.06),
-    "УСН Доходы-Расходы 15%": ("profit", 0.15),
-    "ОСНО 25% от прибыли": ("profit", 0.25),
-}
-
-
-def calc_tax(revenue: float, costs_before_tax: float, regime: str) -> float:
-    mode, rate = TAX_OPTIONS.get(regime, ("none", 0.0))
-    profit_before_tax = revenue - costs_before_tax
-    if mode == "none":
+def find_break_tariff(volume_l: float, df: pd.DataFrame, zone_from: str = None, zone_to: str = None):
+    use = df.copy()
+    if zone_from is not None and "zone_from" in use.columns:
+        use = use[use["zone_from"].astype(str) == str(zone_from)]
+    if zone_to is not None and "zone_to" in use.columns:
+        use = use[use["zone_to"] == zone_to]
+    if use.empty:
         return 0.0
-    if mode == "revenue":
-        return max(revenue * rate, 0.0)
-    if mode == "profit":
-        return max(profit_before_tax, 0.0) * rate
-    return 0.0
+
+    matched = use[(use["break_from"] <= volume_l) & (volume_l <= use["break_to"])]
+    if matched.empty:
+        matched = use.sort_values(["break_to"]).tail(1)
+    row = matched.iloc[0]
+    extra_l = max(0.0, volume_l - safe_float(row.get("break_to", 0.0), 0.0))
+    return round(safe_float(row["base_tariff"], 0.0) + extra_l * safe_float(row.get("per_liter", 0.0), 0.0), 2)
 
 
-# =========================
-# Parsers for uploaded files
-# =========================
 
-@dataclass
-class CommissionRule:
-    commission_pct: float
-    template: str
-    type_name: str
-    subcategory: str
-    category: str
-    search_blob: str
+def classify_by_rules(name: str, commission_df: pd.DataFrame):
+    name_norm = normalize_text(name)
+    name_tokens = set(tokenize(name_norm))
+    best_idx = None
+    best_score = -1.0
+
+    for idx, row in commission_df.iterrows():
+        row_tokens = set(row["tokens"]) if isinstance(row["tokens"], list) else set()
+        overlap = len(name_tokens & row_tokens)
+        seq = SequenceMatcher(None, name_norm, row["search_text"]).ratio()
+        prefix_bonus = 0.0
+        template_name = normalize_text(str(row["template"]).split("_", 1)[-1])
+        if template_name and template_name in name_norm:
+            prefix_bonus = 1.5
+        score = overlap * 1.8 + seq + prefix_bonus
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_idx is None:
+        return None, 0.0
+    return commission_df.loc[best_idx], best_score
 
 
-@st.cache_data(show_spinner=False)
-def load_commission_rules(file_bytes: bytes) -> List[CommissionRule]:
-    xl = pd.ExcelFile(io.BytesIO(file_bytes))
-    sheet = None
-    for s in xl.sheet_names:
-        s_norm = norm_text(s)
-        if "комиссия" in s_norm and ("fbs" in s_norm or "fbo" in s_norm or "комиссия" == s_norm):
-            sheet = s
-            break
-    if sheet is None:
-        sheet = xl.sheet_names[0]
 
-    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
-    col_comm = pick_col(df, ["Комиссия"])
-    col_template = pick_col(df, ["Шаблон товара"])
-    col_type = pick_col(df, ["Тип товара", "Категория товаров"])
-    col_sub = pick_col(df, ["Подкатегория товара", "Подкатегория товаров"])
-    col_cat = pick_col(df, ["Категория"])
-
-    rules: List[CommissionRule] = []
-    for _, row in df.iterrows():
-        commission_raw = to_float(row.get(col_comm, 0))
-        if commission_raw <= 0:
-            continue
-        commission_pct = commission_raw * 100 if commission_raw <= 1 else commission_raw
-        template = clean_text(row.get(col_template, ""))
-        type_name = clean_text(row.get(col_type, ""))
-        subcategory = clean_text(row.get(col_sub, ""))
-        category = clean_text(row.get(col_cat, ""))
-
-        blob = " | ".join([template, type_name, subcategory, category]).strip(" |")
-        if not blob:
-            continue
-
-        rules.append(
-            CommissionRule(
-                commission_pct=commission_pct,
-                template=template,
-                type_name=type_name,
-                subcategory=subcategory,
-                category=category,
-                search_blob=norm_text(blob),
-            )
+def classify_with_ai(name: str, commission_df: pd.DataFrame, api_key: str):
+    if not api_key or OpenAI is None:
+        return None
+    candidates = commission_df[["template", "type", "subcategory", "category", "commission"]].head(250)
+    lines = []
+    for _, row in candidates.iterrows():
+        lines.append(
+            f"Шаблон: {row['template']} | Тип: {row['type']} | Подкатегория: {row['subcategory']} | Категория: {row['category']} | Комиссия: {row['commission']:.4f}"
         )
-    return rules
-
-
-@st.cache_data(show_spinner=False)
-def load_logistics_tables(file_bytes: bytes):
-    xl = pd.ExcelFile(io.BytesIO(file_bytes))
-
-    sheet_last = None
-    sheet_zero = None
-
-    for s in xl.sheet_names:
-        s_norm = norm_text(s)
-        if "последняя миля" in s_norm and "возврат" not in s_norm:
-            sheet_last = s
-        if ("доставка до сц" in s_norm or "нулевая миля" in s_norm) and "возврат" not in s_norm:
-            sheet_zero = s
-
-    if sheet_last is None:
-        raise ValueError("Не найден лист с тарифами последней мили.")
-    if sheet_zero is None:
-        raise ValueError("Не найден лист с тарифами нулевой мили / доставки до СЦ.")
-
-    last_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_last)
-    zero_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_zero)
-
-    # zero mile
-    zero_range_col = pick_col(zero_df, ["Объемный брейк отправления, в л"])
-    zero_tariff_col = pick_col(zero_df, ["Тариф, с НДС"])
-    zero_rows = []
-    for _, row in zero_df.iterrows():
-        lo, hi = parse_range_text(clean_text(row.get(zero_range_col, "")))
-        tariff = to_float(row.get(zero_tariff_col, 0))
-        if hi is None:
-            hi = float("inf")
-        if tariff > 0:
-            zero_rows.append((lo, hi, tariff))
-    zero_rows = sorted(zero_rows, key=lambda x: (x[0], x[1]))
-
-    # last mile
-    col_from = pick_col(last_df, ["Зона откуда"])
-    col_to = pick_col(last_df, ["Зона куда"])
-    col_break = pick_col(last_df, ["Весовой брейк отправления, в л", "Весовой брейк отправления, в л."])
-    col_tariff = pick_col(last_df, ["Тариф, с НДС"])
-    col_plus = pick_col(last_df, ["+1 л, с НДС"])
-
-    last_rows = []
-    for _, row in last_df.iterrows():
-        zone_from = clean_text(row.get(col_from, ""))
-        zone_to = clean_text(row.get(col_to, ""))
-        lo, hi = parse_range_text(clean_text(row.get(col_break, "")))
-        tariff = to_float(row.get(col_tariff, 0))
-        plus_per_l = to_float(row.get(col_plus, 0))
-        if hi is None:
-            hi = float("inf")
-        if zone_to and tariff > 0:
-            last_rows.append((zone_from, zone_to, lo, hi, tariff, plus_per_l))
-
-    return zero_rows, last_rows
-
-
-def get_zero_mile_cost(v_l: float, zero_rows) -> float:
-    for lo, hi, tariff in zero_rows:
-        if v_l >= lo and v_l <= hi:
-            return tariff
-    if zero_rows:
-        lo, hi, tariff = zero_rows[-1]
-        extra = max(v_l - hi, 0) if math.isfinite(hi) else 0
-        return tariff + extra * 0
-    return 0.0
-
-
-def get_last_mile_cost(v_l: float, zone_to: str, origin_zone: int, last_rows) -> float:
-    zone_to_norm = norm_text(zone_to)
-    candidates = []
-    for z_from, z_to, lo, hi, tariff, plus_per_l in last_rows:
-        same_from = str(origin_zone) == str(z_from).strip() if clean_text(z_from) else True
-        if same_from and norm_text(z_to) == zone_to_norm:
-            candidates.append((lo, hi, tariff, plus_per_l))
-    if not candidates:
-        for z_from, z_to, lo, hi, tariff, plus_per_l in last_rows:
-            if norm_text(z_to) == zone_to_norm:
-                candidates.append((lo, hi, tariff, plus_per_l))
-    candidates = sorted(candidates, key=lambda x: (x[0], x[1]))
-    for lo, hi, tariff, plus_per_l in candidates:
-        if v_l >= lo and v_l <= hi:
-            return tariff
-    if candidates:
-        lo, hi, tariff, plus_per_l = candidates[-1]
-        if math.isfinite(hi) and plus_per_l > 0 and v_l > hi:
-            return tariff + (v_l - hi) * plus_per_l
-        return tariff
-    return 0.0
-
-
-# =========================
-# Category detection
-# =========================
-
-def detect_category_by_rules(name: str, rules: List[CommissionRule]) -> Optional[CommissionRule]:
-    name_norm = norm_text(name)
-    if not name_norm:
-        return None
-
-    scored = []
-    name_words = set(name_norm.split())
-
-    for rule in rules:
-        score = 0
-        blob = rule.search_blob
-        if not blob:
-            continue
-
-        template_words = set(blob.split())
-
-        # exact/substring
-        if rule.template and norm_text(rule.template) in name_norm:
-            score += 50
-        if rule.type_name and norm_text(rule.type_name) in name_norm:
-            score += 30
-        if rule.subcategory and norm_text(rule.subcategory) in name_norm:
-            score += 20
-        if rule.category and norm_text(rule.category) in name_norm:
-            score += 10
-
-        # token overlap
-        overlap = len(name_words & template_words)
-        score += overlap * 2
-
-        if score > 0:
-            scored.append((score, rule))
-
-    if not scored:
-        return None
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1]
-
-
-def detect_category_ai(name: str, rules: List[CommissionRule], api_key: str) -> Optional[CommissionRule]:
-    if not api_key or OpenAI is None or not rules:
-        return None
-    variants = []
-    for i, r in enumerate(rules[:400], start=1):
-        label = " | ".join(x for x in [r.template, r.type_name, r.subcategory, r.category] if x)
-        variants.append(f"{i}. {label} -> {r.commission_pct:.2f}%")
-    prompt = (
-        "Ты классификатор товаров для Лемана Про.\n"
-        "Выбери один самый подходящий вариант категории для товара.\n"
-        "Ответь только номером варианта.\n\n"
-        f"Товар: {name}\n\n"
-        "Варианты:\n" + "\n".join(variants)
-    )
+    prompt = "\n".join(lines[:250])
     try:
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Ты выбираешь один лучший вариант категории товара."},
-                {"role": "user", "content": prompt},
-            ],
             temperature=0,
-            max_tokens=10,
+            max_tokens=120,
+            messages=[
+                {"role": "system", "content": "Ты классификатор товаров Лемана Про. Выбери одну наиболее подходящую строку. Ответ только названием шаблона товара из списка."},
+                {"role": "user", "content": f"Товар: {name}\n\nДоступные варианты:\n{prompt}"},
+            ],
         )
-        answer = clean_text(resp.choices[0].message.content)
-        m = re.search(r"\d+", answer)
-        if not m:
-            return None
-        idx = int(m.group(0)) - 1
-        if 0 <= idx < len(rules[:400]):
-            return rules[idx]
+        answer = (resp.choices[0].message.content or "").strip()
+        match = commission_df[commission_df["template"].astype(str).str.strip() == answer]
+        if not match.empty:
+            return match.iloc[0]
     except Exception:
         return None
     return None
 
 
-# =========================
-# Price solver
-# =========================
 
-def economics_at_price(
-    price: float,
-    commission_pct: float,
-    expected_logistics: float,
-    cost: float,
-    acquiring_pct: float,
-    marketing_pct: float,
-    extra_cost: float,
-    tax_regime: str,
-):
-    pct_costs = (commission_pct + acquiring_pct + marketing_pct) / 100.0
-    revenue = price
-    variable_pct_costs = revenue * pct_costs
-    costs_before_tax = cost + expected_logistics + extra_cost + variable_pct_costs
-    tax = calc_tax(revenue, costs_before_tax, tax_regime)
-    profit_after_tax = revenue - costs_before_tax - tax
-    margin_after_tax = (profit_after_tax / revenue * 100.0) if revenue > 0 else 0.0
-    markup = ((price / cost - 1.0) * 100.0) if cost > 0 else 0.0
-    return {
-        "revenue": revenue,
-        "variable_pct_costs": variable_pct_costs,
-        "costs_before_tax": costs_before_tax,
-        "tax": tax,
-        "profit_after_tax": profit_after_tax,
-        "margin_after_tax": margin_after_tax,
-        "markup_pct": markup,
+def calc_tax(revenue: float, total_costs: float, regime: str):
+    profit_before = revenue - total_costs
+    regimes = {
+        "ОСНО (25% от прибыли)": ("profit", 0.25),
+        "УСН Доходы (6%)": ("revenue", 0.06),
+        "УСН Доходы-Расходы (15%)": ("profit", 0.15),
+        "АУСН (8% от дохода)": ("revenue", 0.08),
+        "УСН НДС 5%": ("revenue", 0.05),
+        "УСН НДС 7%": ("revenue", 0.07),
     }
+    mode, rate = regimes.get(regime, ("profit", 0.0))
+    tax = revenue * rate if mode == "revenue" else max(profit_before, 0) * rate
+    profit_after = profit_before - tax
+    margin_after = (profit_after / revenue * 100) if revenue > 0 else 0.0
+    return round(tax, 2), round(profit_after, 2), round(margin_after, 2)
 
 
-def solve_recommended_price(
-    target_margin_pct: float,
-    commission_pct: float,
-    expected_logistics: float,
-    cost: float,
-    acquiring_pct: float,
-    marketing_pct: float,
-    extra_cost: float,
-    tax_regime: str,
-    rounding_step: int,
-) -> float:
-    # binary search on price that gives target margin after tax
-    low = max(cost + expected_logistics + extra_cost, 1.0)
-    high = max(low * 5, 100.0)
-    for _ in range(40):
-        e = economics_at_price(high, commission_pct, expected_logistics, cost, acquiring_pct, marketing_pct, extra_cost, tax_regime)
-        if e["margin_after_tax"] >= target_margin_pct:
-            break
-        high *= 1.8
 
-    for _ in range(80):
-        mid = (low + high) / 2
-        e = economics_at_price(mid, commission_pct, expected_logistics, cost, acquiring_pct, marketing_pct, extra_cost, tax_regime)
-        if e["margin_after_tax"] >= target_margin_pct:
-            high = mid
-        else:
-            low = mid
-    return round_price(high, rounding_step)
+def recommended_price(target_margin_pct, cost, fixed_costs, percent_costs_pct):
+    denom = 1 - target_margin_pct / 100 - percent_costs_pct / 100
+    if denom <= 0:
+        return 0.0
+    return (cost + fixed_costs) / denom
 
 
-# =========================
-# UI
-# =========================
 
-st.title("Лемана Про — простая юнит-экономика")
-st.caption("Загрузите каталог, при необходимости загрузите файл тарифов/комиссий, и получите одну рекомендованную цену продажи.")
+def round_price(value: float, step: int):
+    if value <= 0:
+        return 0.0
+    return math.ceil(value / step) * step
+
+
+st.title("Лемана Про — простой калькулятор юнит-экономики")
+st.caption("Один стандартный файл Лемана Про для комиссий и логистики + один файл товаров.")
 
 with st.sidebar:
-    st.subheader("Параметры расчета")
-    tax_regime = st.selectbox("Налог", list(TAX_OPTIONS.keys()), index=0)
-    target_margin_pct = st.slider("Целевая маржа после налога, %", 0, 60, 20)
-    acquiring_pct = st.number_input("Эквайринг, %", min_value=0.0, max_value=10.0, value=1.5, step=0.1)
-    marketing_pct = st.number_input("Маркетинг / реклама, %", min_value=0.0, max_value=30.0, value=0.0, step=0.1)
-    extra_cost = st.number_input("Прочие расходы на 1 шт., руб", min_value=0.0, max_value=100000.0, value=0.0, step=10.0)
-    rounding_step = st.selectbox("Округление цены, руб", [1, 5, 10, 50, 100], index=2)
+    st.subheader("1. Параметры")
+    scheme = st.selectbox("Схема", ["FBS", "FBO"], index=0)
+    tax_regime = st.selectbox("Налог", [
+        "ОСНО (25% от прибыли)",
+        "УСН Доходы (6%)",
+        "УСН Доходы-Расходы (15%)",
+        "АУСН (8% от дохода)",
+        "УСН НДС 5%",
+        "УСН НДС 7%",
+    ])
+    target_margin = st.slider("Целевая маржа после налога, %", 0, 60, 20)
+    acquiring_pct = st.number_input("Эквайринг, %", 0.0, 10.0, 1.5, 0.1)
+    marketing_pct = st.number_input("Маркетинг, %", 0.0, 30.0, 0.0, 0.1)
+    early_payout_pct = st.number_input("Ранняя выплата, %", 0.0, 10.0, 0.0, 0.1)
+    extra_cost_per_unit = st.number_input("Прочие расходы на ед., руб", 0.0, 100000.0, 0.0, 10.0)
+    price_round_step = st.selectbox("Округление цены", [1, 10, 50, 100], index=2)
 
     st.divider()
-    st.subheader("FBS — настройки логистики")
-    origin_zone = st.number_input("Зона откуда (Москва склад = 9)", min_value=1, max_value=20, value=9, step=1)
-
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        share_moscow = st.number_input("Москва/МО, %", min_value=0.0, max_value=100.0, value=70.0, step=1.0)
-    with c2:
-        share_spb = st.number_input("СПБ/ЛО, %", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
-    with c3:
-        share_regions = st.number_input("Регионы, %", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
+    st.subheader("2. Логистика FBS")
+    warehouse_zone = st.selectbox("Зона откуда", ["9"], index=0, help="Для склада в Москве используем зону 9.")
+    msk_share = st.number_input("Доля Москва и МО, %", 0.0, 100.0, 70.0, 1.0)
+    spb_share = st.number_input("Доля СПБ и ЛО, %", 0.0, 100.0, 20.0, 1.0)
+    region_share = st.number_input("Доля Регионы, %", 0.0, 100.0, 10.0, 1.0)
+    buyout_rate = st.number_input("Выкуп, %", 0.0, 100.0, 95.0, 1.0)
+    return_after_buyout = st.number_input("Возвраты после выкупа, %", 0.0, 100.0, 3.0, 1.0)
 
     st.divider()
-    st.subheader("Категоризация")
-    use_ai = st.checkbox("Использовать OpenAI, если ключ есть", value=False)
-    openai_key = st.text_input("OpenAI API key", type="password", value=st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "")
+    st.subheader("3. Единицы измерения")
+    dim_unit = st.selectbox("Габариты в файле товаров", ["см", "мм"], index=0)
+    wt_unit = st.selectbox("Вес в файле товаров", ["кг", "г"], index=0)
 
-zone_sum = share_moscow + share_spb + share_regions
-if zone_sum <= 0:
-    st.error("Сумма долей зон должна быть больше 0%.")
-    st.stop()
+    st.divider()
+    st.subheader("4. AI, если понадобится")
+    use_ai = st.checkbox("Использовать AI для сложных товаров", value=False)
+    openai_key = st.text_input("OpenAI API Key", type="password") if use_ai else ""
 
-zone_weights = {
-    "Москва и МО": share_moscow / zone_sum,
-    "СПБ и ЛО": share_spb / zone_sum,
-    "Регионы": share_regions / zone_sum,
-}
-
-st.subheader("1. Загрузите файлы")
-catalog_file = st.file_uploader("Каталог товаров Excel: артикул, наименование, длина, ширина, высота, вес, себестоимость", type=["xlsx", "xls"])
-commission_file = st.file_uploader("Файл комиссий Excel", type=["xlsx", "xls"])
-logistics_file = st.file_uploader("Файл логистики Excel", type=["xlsx", "xls"])
-
-st.info(
-    "Минимум нужен каталог. "
-    "Если не загрузить тарифы и комиссии, приложение не сможет корректно посчитать результат."
+ratebook_upload = st.file_uploader(
+    "Стандартный файл Лемана Про с комиссиями и логистикой (один Excel)",
+    type=["xlsx"],
+    help="Лучший вариант для пользователей: хранить файл в корне репозитория как lemanpro_rates.xlsx. Тогда загружать его руками не придется."
 )
 
-if catalog_file and commission_file and logistics_file:
-    try:
-        rules = load_commission_rules(commission_file.getvalue())
-        zero_rows, last_rows = load_logistics_tables(logistics_file.getvalue())
-    except Exception as e:
-        st.error(f"Ошибка чтения файлов комиссий/логистики: {e}")
-        st.stop()
+ratebook = None
+source_note = None
+try:
+    if ratebook_upload is not None:
+        ratebook = load_standard_ratebook_from_bytes(ratebook_upload.getvalue(), ratebook_upload.name)
+        source_note = f"Файл загружен вручную: {ratebook_upload.name}"
+    else:
+        existing = find_existing_rates_file()
+        if existing:
+            ratebook = load_standard_ratebook_from_path(existing)
+            source_note = f"Файл найден в проекте: {existing}"
+except Exception as e:
+    st.error(f"Не удалось прочитать стандартный файл Лемана Про: {e}")
 
-    try:
-        catalog = pd.read_excel(catalog_file)
-    except Exception as e:
-        st.error(f"Ошибка чтения каталога: {e}")
-        st.stop()
+if source_note:
+    st.success(source_note)
 
-    col_sku = pick_col(catalog, ["Артикул", "SKU", "sku"])
-    col_name = pick_col(catalog, ["Наименование", "Название", "Товар"])
-    col_len = pick_col(catalog, ["Длина"])
-    col_wid = pick_col(catalog, ["Ширина"])
-    col_hei = pick_col(catalog, ["Высота"])
-    col_wgt = pick_col(catalog, ["Вес"])
-    col_cost = pick_col(catalog, ["Себестоимость", "Закупка", "Себес"])
+with st.expander("Как сделать удобно и просто для пользователей", expanded=ratebook is None):
+    st.markdown(
+        """
+**Рекомендую такой сценарий:**
 
-    missing = [x for x in [
-        ("Артикул", col_sku), ("Наименование", col_name), ("Длина", col_len),
-        ("Ширина", col_wid), ("Высота", col_hei), ("Вес", col_wgt), ("Себестоимость", col_cost)
-    ] if x[1] is None]
+1. В корень репозитория кладёте **один стандартный файл** Лемана Про и называете его `lemanpro_rates.xlsx`.
+2. Пользователь открывает приложение и **загружает только файл товаров**.
+3. Если Лемана Про обновила тарифы или комиссии — вы просто **заменяете один файл** `lemanpro_rates.xlsx` в репозитории.
+4. Код при этом обычно менять не нужно.
 
+**Ручная загрузка файла в интерфейсе** нужна только как запасной вариант, если файл в репозитории временно не лежит.
+        """
+    )
+
+product_file = st.file_uploader(
+    "Файл товаров: SKU / Наименование / Длина / Ширина / Высота / Вес / Себестоимость / (необязательно) Текущая цена",
+    type=["xlsx", "xls", "csv"]
+)
+
+
+def read_products(uploaded_file):
+    if uploaded_file is None:
+        return pd.DataFrame()
+    if uploaded_file.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+    rename_map = {}
+    for col in df.columns:
+        c = normalize_text(col)
+        if c in {"sku", "артикул", "артикул товара", "seller sku"}:
+            rename_map[col] = "sku"
+        elif c in {"наименование", "название", "наименование товара", "товар"}:
+            rename_map[col] = "name"
+        elif c in {"длина", "длина см", "length"}:
+            rename_map[col] = "length"
+        elif c in {"ширина", "ширина см", "width"}:
+            rename_map[col] = "width"
+        elif c in {"высота", "высота см", "height"}:
+            rename_map[col] = "height"
+        elif c in {"вес", "вес кг", "weight"}:
+            rename_map[col] = "weight"
+        elif c in {"себестоимость", "себес", "cost", "закупка"}:
+            rename_map[col] = "cost"
+        elif c in {"цена", "текущая цена", "price", "цена продажи"}:
+            rename_map[col] = "current_price"
+    df = df.rename(columns=rename_map)
+    required = ["sku", "name", "length", "width", "height", "weight", "cost"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        st.error("В каталоге не найдены обязательные колонки: " + ", ".join(name for name, _ in missing))
+        raise ValueError(f"В файле товаров не хватает колонок: {', '.join(missing)}")
+    keep = required + (["current_price"] if "current_price" in df.columns else [])
+    return df[keep].copy()
+
+
+products = pd.DataFrame()
+if product_file is not None:
+    try:
+        products = read_products(product_file)
+        st.write("Предпросмотр товаров")
+        st.dataframe(products.head(20), use_container_width=True)
+    except Exception as e:
+        st.error(str(e))
+
+if st.button("Рассчитать", type="primary", disabled=(ratebook is None or products.empty)):
+    commission_df = ratebook["commission"]
+    last_mile_df = ratebook["last_mile"]
+    return_last_mile_df = ratebook["return_last_mile"]
+    to_sc_df = ratebook["to_sc"]
+    return_to_sc_df = ratebook["return_to_sc"]
+
+    total_share = msk_share + spb_share + region_share
+    if total_share <= 0:
+        st.error("Сумма долей зон должна быть больше 0%.")
         st.stop()
+    msk_w = msk_share / total_share
+    spb_w = spb_share / total_share
+    reg_w = region_share / total_share
+
+    buyout = buyout_rate / 100
+    cancel_or_not_buyout = 1 - buyout
+    post_buyout_return = return_after_buyout / 100
 
     results = []
     progress = st.progress(0)
 
-    for idx, row in catalog.iterrows():
-        sku = clean_text(row.get(col_sku, ""))
-        name = clean_text(row.get(col_name, ""))
-        length_cm = to_float(row.get(col_len, 0))
-        width_cm = to_float(row.get(col_wid, 0))
-        height_cm = to_float(row.get(col_hei, 0))
-        weight_kg = to_float(row.get(col_wgt, 0))
-        cost = to_float(row.get(col_cost, 0))
+    for i, row in products.reset_index(drop=True).iterrows():
+        name = str(row["name"])
+        sku = str(row["sku"])
+        length_cm = normalize_dimension(row["length"], dim_unit)
+        width_cm = normalize_dimension(row["width"], dim_unit)
+        height_cm = normalize_dimension(row["height"], dim_unit)
+        weight_kg = normalize_weight(row["weight"], wt_unit)
+        cost = safe_float(row["cost"])
+        current_price = safe_float(row.get("current_price", 0.0), 0.0)
 
-        vol = volume_l(length_cm, width_cm, height_cm)
+        volume_l = max(length_cm * width_cm * height_cm / 1000.0, 0.0)
 
-        rule = detect_category_by_rules(name, rules)
-        if use_ai and openai_key:
-            ai_rule = detect_category_ai(name, rules, openai_key)
-            if ai_rule is not None:
-                rule = ai_rule
+        matched_row, score = classify_by_rules(name, commission_df)
+        if use_ai and openai_key and (matched_row is None or score < 1.4):
+            ai_match = classify_with_ai(name, commission_df, openai_key)
+            if ai_match is not None:
+                matched_row = ai_match
+                score = max(score, 9.9)
 
-        commission_pct = rule.commission_pct if rule else 0.0
-        template = rule.template if rule else "Не определено"
-        category = rule.category if rule else "Не определено"
+        template = matched_row["template"] if matched_row is not None else "Не определено"
+        item_type = matched_row["type"] if matched_row is not None else ""
+        subcat = matched_row["subcategory"] if matched_row is not None else ""
+        category = matched_row["category"] if matched_row is not None else ""
+        commission_pct = safe_float(matched_row["commission"] * 100 if matched_row is not None else 0.0)
 
-        zero_mile = get_zero_mile_cost(vol, zero_rows)
-        lm_moscow = get_last_mile_cost(vol, "Москва и МО", origin_zone, last_rows)
-        lm_spb = get_last_mile_cost(vol, "СПБ и ЛО", origin_zone, last_rows)
-        lm_regions = get_last_mile_cost(vol, "Регионы", origin_zone, last_rows)
+        to_sc = find_break_tariff(volume_l, to_sc_df)
+        return_to_sc = find_break_tariff(volume_l, return_to_sc_df)
+        lm_msk = find_break_tariff(volume_l, last_mile_df, zone_from=warehouse_zone, zone_to="Москва и МО")
+        lm_spb = find_break_tariff(volume_l, last_mile_df, zone_from=warehouse_zone, zone_to="СПБ и ЛО")
+        lm_reg = find_break_tariff(volume_l, last_mile_df, zone_from=warehouse_zone, zone_to="Регионы")
 
-        expected_last_mile = (
-            zone_weights["Москва и МО"] * lm_moscow
-            + zone_weights["СПБ и ЛО"] * lm_spb
-            + zone_weights["Регионы"] * lm_regions
-        )
+        ret_lm_msk = find_break_tariff(volume_l, return_last_mile_df, zone_from=warehouse_zone, zone_to="Москва и МО")
+        ret_lm_spb = find_break_tariff(volume_l, return_last_mile_df, zone_from=warehouse_zone, zone_to="СПБ и ЛО")
+        ret_lm_reg = find_break_tariff(volume_l, return_last_mile_df, zone_from=warehouse_zone, zone_to="Регионы")
 
-        expected_logistics = zero_mile + expected_last_mile
+        avg_last_mile = lm_msk * msk_w + lm_spb * spb_w + lm_reg * reg_w
+        avg_return_last_mile = ret_lm_msk * msk_w + ret_lm_spb * spb_w + ret_lm_reg * reg_w
 
-        rec_price = solve_recommended_price(
-            target_margin_pct=target_margin_pct,
-            commission_pct=commission_pct,
-            expected_logistics=expected_logistics,
-            cost=cost,
-            acquiring_pct=acquiring_pct,
-            marketing_pct=marketing_pct,
-            extra_cost=extra_cost,
-            tax_regime=tax_regime,
-            rounding_step=rounding_step,
-        )
+        # Ожидаемая логистика на 1 успешную продажу
+        if scheme == "FBS":
+            expected_logistics = (
+                to_sc + avg_last_mile
+                + cancel_or_not_buyout * (avg_return_last_mile + return_to_sc)
+                + buyout * post_buyout_return * (avg_return_last_mile + return_to_sc)
+            )
+        else:
+            expected_logistics = avg_last_mile
 
-        econ = economics_at_price(
-            price=rec_price,
-            commission_pct=commission_pct,
-            expected_logistics=expected_logistics,
-            cost=cost,
-            acquiring_pct=acquiring_pct,
-            marketing_pct=marketing_pct,
-            extra_cost=extra_cost,
-            tax_regime=tax_regime,
-        )
+        percent_costs_pct = commission_pct + acquiring_pct + marketing_pct + early_payout_pct
+        rec_price_raw = recommended_price(target_margin, cost, expected_logistics + extra_cost_per_unit, percent_costs_pct)
+        rec_price = round_price(rec_price_raw, price_round_step)
+
+        pct_costs_rub = rec_price * percent_costs_pct / 100
+        total_costs_before_tax = cost + expected_logistics + extra_cost_per_unit + pct_costs_rub
+        tax, profit_after_tax, margin_after_tax = calc_tax(rec_price, total_costs_before_tax, tax_regime)
+        profit_before_tax = rec_price - total_costs_before_tax
+        margin_before_tax = (profit_before_tax / rec_price * 100) if rec_price > 0 else 0.0
+        markup_pct = ((rec_price / (cost + expected_logistics + extra_cost_per_unit)) - 1) * 100 if (cost + expected_logistics + extra_cost_per_unit) > 0 else 0.0
+
+        current_profit_after_tax = current_margin_after_tax = None
+        if current_price > 0:
+            current_pct_costs = current_price * percent_costs_pct / 100
+            current_total_costs = cost + expected_logistics + extra_cost_per_unit + current_pct_costs
+            _, current_profit_after_tax, current_margin_after_tax = calc_tax(current_price, current_total_costs, tax_regime)
 
         results.append({
-            "Артикул": sku,
+            "SKU": sku,
             "Наименование": name,
-            "Шаблон товара": template,
+            "Схема": scheme,
+            "Шаблон": template,
+            "Тип": item_type,
+            "Подкатегория": subcat,
             "Категория": category,
+            "Совпадение": round(score, 2),
             "Комиссия, %": round(commission_pct, 2),
             "Длина, см": round(length_cm, 2),
             "Ширина, см": round(width_cm, 2),
             "Высота, см": round(height_cm, 2),
             "Вес, кг": round(weight_kg, 3),
-            "Объем, л": round(vol, 3),
-            "Нулевая миля, руб": round(zero_mile, 2),
-            "Последняя миля Москва/МО, руб": round(lm_moscow, 2),
-            "Последняя миля СПБ/ЛО, руб": round(lm_spb, 2),
-            "Последняя миля Регионы, руб": round(lm_regions, 2),
-            "Средняя последняя миля, руб": round(expected_last_mile, 2),
-            "Средняя логистика, руб": round(expected_logistics, 2),
+            "Объем, л": round(volume_l, 2),
+            "Доставка до СЦ, руб": round(to_sc, 2),
+            "Возврат до СЦ, руб": round(return_to_sc, 2),
+            "Последняя миля Москва, руб": round(lm_msk, 2),
+            "Последняя миля СПБ, руб": round(lm_spb, 2),
+            "Последняя миля Регионы, руб": round(lm_reg, 2),
+            "Средняя последняя миля, руб": round(avg_last_mile, 2),
+            "Средняя возвратная миля, руб": round(avg_return_last_mile, 2),
+            "Ожидаемая логистика, руб": round(expected_logistics, 2),
             "Себестоимость, руб": round(cost, 2),
+            "Прочие расходы, руб": round(extra_cost_per_unit, 2),
+            "Текущая цена, руб": round(current_price, 2) if current_price > 0 else None,
+            "Текущая прибыль после налога, руб": round(current_profit_after_tax, 2) if current_profit_after_tax is not None else None,
+            "Текущая маржа после налога, %": round(current_margin_after_tax, 2) if current_margin_after_tax is not None else None,
             "Рекомендованная цена, руб": round(rec_price, 2),
-            "Прибыль после налога, руб": round(econ["profit_after_tax"], 2),
-            "Маржа после налога, %": round(econ["margin_after_tax"], 2),
-            "Наценка, %": round(econ["markup_pct"], 2),
+            "Процентные расходы, %": round(percent_costs_pct, 2),
+            "Процентные расходы, руб": round(pct_costs_rub, 2),
+            "Прибыль до налога, руб": round(profit_before_tax, 2),
+            "Маржа до налога, %": round(margin_before_tax, 2),
+            "Налог, руб": round(tax, 2),
+            "Прибыль после налога, руб": round(profit_after_tax, 2),
+            "Маржа после налога, %": round(margin_after_tax, 2),
+            "Наценка, %": round(markup_pct, 2),
+            "Флаг": "Проверить" if (score < 1.2 or margin_after_tax < target_margin - 2) else "ОК",
         })
+        progress.progress((i + 1) / len(products))
 
-        progress.progress((idx + 1) / max(len(catalog), 1))
+    result_df = pd.DataFrame(results)
 
-    progress.empty()
-
-    res_df = pd.DataFrame(results)
-
-    st.subheader("2. Результат")
     k1, k2, k3, k4 = st.columns(4)
-    with k1:
-        st.metric("SKU", len(res_df))
-    with k2:
-        st.metric("Средняя комиссия, %", round(res_df["Комиссия, %"].mean(), 2) if len(res_df) else 0)
-    with k3:
-        st.metric("Средняя логистика, руб", round(res_df["Средняя логистика, руб"].mean(), 2) if len(res_df) else 0)
-    with k4:
-        st.metric("Средняя рекомендованная цена, руб", round(res_df["Рекомендованная цена, руб"].mean(), 2) if len(res_df) else 0)
+    k1.metric("SKU", len(result_df))
+    k2.metric("Средняя комиссия, %", f"{result_df['Комиссия, %'].mean():.2f}")
+    k3.metric("Средняя логистика, руб", f"{result_df['Ожидаемая логистика, руб'].mean():.0f}")
+    k4.metric("Средняя рекомендованная цена, руб", f"{result_df['Рекомендованная цена, руб'].mean():.0f}")
 
-    st.dataframe(res_df, use_container_width=True, height=600)
+    st.subheader("Результат")
+    st.dataframe(result_df, use_container_width=True, height=650)
 
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        res_df.to_excel(writer, sheet_name="Результат", index=False)
-    st.download_button(
-        "Скачать результат в Excel",
-        data=output.getvalue(),
-        file_name="lemanpro_result.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    output = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
+    with pd.ExcelWriter(output.name, engine="openpyxl") as writer:
+        result_df.to_excel(writer, sheet_name="Результат", index=False)
+        pd.DataFrame({
+            "Параметр": [
+                "Схема", "Налог", "Целевая маржа, %", "Эквайринг, %", "Маркетинг, %", "Ранняя выплата, %",
+                "Прочие расходы, руб", "Склад FBS / Зона откуда", "Москва и МО, %", "СПБ и ЛО, %", "Регионы, %",
+                "Выкуп, %", "Возвраты после выкупа, %", "Файл тарифов"
+            ],
+            "Значение": [
+                scheme, tax_regime, target_margin, acquiring_pct, marketing_pct, early_payout_pct,
+                extra_cost_per_unit, warehouse_zone, msk_share, spb_share, region_share,
+                buyout_rate, return_after_buyout, source_note or ""
+            ]
+        }).to_excel(writer, sheet_name="Параметры", index=False)
 
-    with st.expander("Как считает приложение"):
-        st.markdown(
-            """
-            **Логика простая:**
-            1. По наименованию товара определяется шаблон/категория из файла комиссий.  
-            2. По габаритам считается объем в литрах.  
-            3. По объему считается:
-               - нулевая миля,
-               - последняя миля по Москве/МО,
-               - последняя миля по СПБ/ЛО,
-               - последняя миля по регионам.  
-            4. Из долей зон строится **одна средняя логистика**.  
-            5. Система подбирает **одну рекомендованную цену**, при которой достигается целевая маржа.
-            """
+    with open(output.name, "rb") as f:
+        st.download_button(
+            "Скачать результат Excel",
+            data=f.read(),
+            file_name="lemanpro_unit_economics.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-else:
-    st.warning("Загрузите 3 файла: каталог, комиссии, логистику.")
