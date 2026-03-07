@@ -3,6 +3,7 @@ import re
 import math
 import tempfile
 from difflib import SequenceMatcher
+from io import BytesIO
 
 import pandas as pd
 import streamlit as st
@@ -22,10 +23,11 @@ DEFAULT_RATES_PATHS = [
 
 STOPWORDS = {
     "для", "и", "или", "в", "во", "на", "по", "с", "со", "из", "к", "от", "до", "под", "над",
-    "the", "and", "or", "of", "a", "an", "to", "with", "без", "под", "из", "за", "при", "над", "от"
+    "the", "and", "or", "of", "a", "an", "to", "with", "без", "за", "при"
 }
 
 
+# ---------- helpers ----------
 def normalize_text(text: str) -> str:
     text = str(text or "").lower().strip()
     text = text.replace("ё", "е")
@@ -35,11 +37,9 @@ def normalize_text(text: str) -> str:
     return text
 
 
-
 def tokenize(text: str):
     tokens = re.findall(r"[a-zа-я0-9]+", normalize_text(text))
     return [t for t in tokens if len(t) > 2 and t not in STOPWORDS]
-
 
 
 def safe_float(value, default=0.0):
@@ -51,14 +51,12 @@ def safe_float(value, default=0.0):
         return default
 
 
-
 def normalize_dimension(value, unit: str):
     v = safe_float(value, 0.0)
     unit = str(unit).strip().lower()
     if unit in ("мм", "mm"):
         return v / 10.0
     return v
-
 
 
 def normalize_weight(value, unit: str):
@@ -69,12 +67,58 @@ def normalize_weight(value, unit: str):
     return v
 
 
-
 def find_existing_rates_file():
     for path in DEFAULT_RATES_PATHS:
         if os.path.exists(path):
             return path
     return None
+
+
+def make_template_excel_bytes() -> bytes:
+    df = pd.DataFrame([
+        {
+            "SKU": "ART-001",
+            "Наименование": "Смеситель для кухни хром",
+            "Длина": 35,
+            "Ширина": 18,
+            "Высота": 8,
+            "Вес": 1.2,
+            "Себестоимость": 2450,
+            "Текущая цена": 3990,
+        },
+        {
+            "SKU": "ART-002",
+            "Наименование": "Лампа настольная черная",
+            "Длина": 42,
+            "Ширина": 16,
+            "Высота": 16,
+            "Вес": 2.1,
+            "Себестоимость": 1800,
+            "Текущая цена": 0,
+        },
+    ])
+    info = pd.DataFrame({
+        "Поле": [
+            "SKU", "Наименование", "Длина", "Ширина", "Высота", "Вес", "Себестоимость", "Текущая цена"
+        ],
+        "Обязательно": ["Да", "Да", "Да", "Да", "Да", "Да", "Да", "Нет"],
+        "Комментарий": [
+            "Артикул продавца",
+            "Название товара для определения категории",
+            "Габарит товара или упаковки",
+            "Габарит товара или упаковки",
+            "Габарит товара или упаковки",
+            "Вес товара или упаковки",
+            "Полная себестоимость единицы",
+            "Необязательное поле для сравнения с текущей ценой",
+        ],
+    })
+    bio = BytesIO()
+    with pd.ExcelWriter(bio, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Шаблон", index=False)
+        info.to_excel(writer, sheet_name="Описание", index=False)
+    bio.seek(0)
+    return bio.getvalue()
 
 
 @st.cache_data(show_spinner=False)
@@ -153,16 +197,12 @@ def load_standard_ratebook_from_path(path: str):
 
 
 @st.cache_data(show_spinner=False)
-def load_standard_ratebook_from_bytes(file_bytes: bytes, file_name: str):
+def load_standard_ratebook_from_bytes(file_bytes: bytes):
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
     tmp.write(file_bytes)
     tmp.flush()
     tmp.close()
-    try:
-        return load_standard_ratebook_from_path(tmp.name)
-    finally:
-        pass
-
+    return load_standard_ratebook_from_path(tmp.name)
 
 
 def find_break_tariff(volume_l: float, df: pd.DataFrame, zone_from: str = None, zone_to: str = None):
@@ -170,7 +210,7 @@ def find_break_tariff(volume_l: float, df: pd.DataFrame, zone_from: str = None, 
     if zone_from is not None and "zone_from" in use.columns:
         use = use[use["zone_from"].astype(str) == str(zone_from)]
     if zone_to is not None and "zone_to" in use.columns:
-        use = use[use["zone_to"] == zone_to]
+        use = use[use["zone_to"].astype(str).str.strip() == str(zone_to).strip()]
     if use.empty:
         return 0.0
 
@@ -180,7 +220,6 @@ def find_break_tariff(volume_l: float, df: pd.DataFrame, zone_from: str = None, 
     row = matched.iloc[0]
     extra_l = max(0.0, volume_l - safe_float(row.get("break_to", 0.0), 0.0))
     return round(safe_float(row["base_tariff"], 0.0) + extra_l * safe_float(row.get("per_liter", 0.0), 0.0), 2)
-
 
 
 def classify_by_rules(name: str, commission_df: pd.DataFrame):
@@ -193,10 +232,8 @@ def classify_by_rules(name: str, commission_df: pd.DataFrame):
         row_tokens = set(row["tokens"]) if isinstance(row["tokens"], list) else set()
         overlap = len(name_tokens & row_tokens)
         seq = SequenceMatcher(None, name_norm, row["search_text"]).ratio()
-        prefix_bonus = 0.0
         template_name = normalize_text(str(row["template"]).split("_", 1)[-1])
-        if template_name and template_name in name_norm:
-            prefix_bonus = 1.5
+        prefix_bonus = 1.5 if template_name and template_name in name_norm else 0.0
         score = overlap * 1.8 + seq + prefix_bonus
         if score > best_score:
             best_score = score
@@ -205,7 +242,6 @@ def classify_by_rules(name: str, commission_df: pd.DataFrame):
     if best_idx is None:
         return None, 0.0
     return commission_df.loc[best_idx], best_score
-
 
 
 def classify_with_ai(name: str, commission_df: pd.DataFrame, api_key: str):
@@ -217,7 +253,7 @@ def classify_with_ai(name: str, commission_df: pd.DataFrame, api_key: str):
         lines.append(
             f"Шаблон: {row['template']} | Тип: {row['type']} | Подкатегория: {row['subcategory']} | Категория: {row['category']} | Комиссия: {row['commission']:.4f}"
         )
-    prompt = "\n".join(lines[:250])
+    prompt = "\n".join(lines)
     try:
         client = OpenAI(api_key=api_key)
         resp = client.chat.completions.create(
@@ -238,7 +274,6 @@ def classify_with_ai(name: str, commission_df: pd.DataFrame, api_key: str):
     return None
 
 
-
 def calc_tax(revenue: float, total_costs: float, regime: str):
     profit_before = revenue - total_costs
     regimes = {
@@ -256,13 +291,11 @@ def calc_tax(revenue: float, total_costs: float, regime: str):
     return round(tax, 2), round(profit_after, 2), round(margin_after, 2)
 
 
-
 def recommended_price(target_margin_pct, cost, fixed_costs, percent_costs_pct):
     denom = 1 - target_margin_pct / 100 - percent_costs_pct / 100
     if denom <= 0:
         return 0.0
     return (cost + fixed_costs) / denom
-
 
 
 def round_price(value: float, step: int):
@@ -271,11 +304,54 @@ def round_price(value: float, step: int):
     return math.ceil(value / step) * step
 
 
-st.title("Лемана Про — простой калькулятор юнит-экономики")
-st.caption("Один стандартный файл Лемана Про для комиссий и логистики + один файл товаров.")
+def read_products(uploaded_file):
+    if uploaded_file is None:
+        return pd.DataFrame()
+
+    if uploaded_file.name.lower().endswith(".csv"):
+        df = pd.read_csv(uploaded_file)
+    else:
+        df = pd.read_excel(uploaded_file)
+
+    rename_map = {}
+    for col in df.columns:
+        c = normalize_text(col)
+        if c in {"sku", "артикул", "артикул товара", "seller sku", "vendorcode", "vendor code"}:
+            rename_map[col] = "sku"
+        elif c in {"наименование", "название", "наименование товара", "товар", "name", "item name"}:
+            rename_map[col] = "name"
+        elif c in {"длина", "длина см", "length"}:
+            rename_map[col] = "length"
+        elif c in {"ширина", "ширина см", "width"}:
+            rename_map[col] = "width"
+        elif c in {"высота", "высота см", "height"}:
+            rename_map[col] = "height"
+        elif c in {"вес", "вес кг", "weight"}:
+            rename_map[col] = "weight"
+        elif c in {"себестоимость", "себес", "cost", "закупка"}:
+            rename_map[col] = "cost"
+        elif c in {"цена", "текущая цена", "price", "цена продажи"}:
+            rename_map[col] = "current_price"
+
+    df = df.rename(columns=rename_map)
+    required = ["sku", "name", "length", "width", "height", "weight", "cost"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            "В файле товаров не хватает колонок: " + ", ".join(missing) + 
+            ". Скачайте шаблон ниже и заполните его по образцу."
+        )
+
+    keep = required + (["current_price"] if "current_price" in df.columns else [])
+    return df[keep].copy()
+
+
+# ---------- UI ----------
+st.title("Лемана Про — калькулятор юнит-экономики")
+st.caption("Менеджер загружает только файл товаров. Комиссии и логистика берутся из стандартного файла Лемана Про.")
 
 with st.sidebar:
-    st.subheader("1. Параметры")
+    st.subheader("Параметры")
     scheme = st.selectbox("Схема", ["FBS", "FBO"], index=0)
     tax_regime = st.selectbox("Налог", [
         "ОСНО (25% от прибыли)",
@@ -293,7 +369,7 @@ with st.sidebar:
     price_round_step = st.selectbox("Округление цены", [1, 10, 50, 100], index=2)
 
     st.divider()
-    st.subheader("2. Логистика FBS")
+    st.subheader("Логистика FBS")
     warehouse_zone = st.selectbox("Зона откуда", ["9"], index=0, help="Для склада в Москве используем зону 9.")
     msk_share = st.number_input("Доля Москва и МО, %", 0.0, 100.0, 70.0, 1.0)
     spb_share = st.number_input("Доля СПБ и ЛО, %", 0.0, 100.0, 20.0, 1.0)
@@ -302,26 +378,26 @@ with st.sidebar:
     return_after_buyout = st.number_input("Возвраты после выкупа, %", 0.0, 100.0, 3.0, 1.0)
 
     st.divider()
-    st.subheader("3. Единицы измерения")
+    st.subheader("Единицы измерения")
     dim_unit = st.selectbox("Габариты в файле товаров", ["см", "мм"], index=0)
     wt_unit = st.selectbox("Вес в файле товаров", ["кг", "г"], index=0)
 
     st.divider()
-    st.subheader("4. AI, если понадобится")
+    st.subheader("AI")
     use_ai = st.checkbox("Использовать AI для сложных товаров", value=False)
     openai_key = st.text_input("OpenAI API Key", type="password") if use_ai else ""
 
 ratebook_upload = st.file_uploader(
-    "Стандартный файл Лемана Про с комиссиями и логистикой (один Excel)",
+    "Стандартный файл Лемана Про с комиссиями и логистикой",
     type=["xlsx"],
-    help="Лучший вариант для пользователей: хранить файл в корне репозитория как lemanpro_rates.xlsx. Тогда загружать его руками не придется."
+    help="Если файл уже лежит в репозитории как lemanpro_rates.xlsx, менеджеру ничего сюда загружать не нужно."
 )
 
 ratebook = None
 source_note = None
 try:
     if ratebook_upload is not None:
-        ratebook = load_standard_ratebook_from_bytes(ratebook_upload.getvalue(), ratebook_upload.name)
+        ratebook = load_standard_ratebook_from_bytes(ratebook_upload.getvalue())
         source_note = f"Файл загружен вручную: {ratebook_upload.name}"
     else:
         existing = find_existing_rates_file()
@@ -334,60 +410,23 @@ except Exception as e:
 if source_note:
     st.success(source_note)
 
-with st.expander("Как сделать удобно и просто для пользователей", expanded=ratebook is None):
-    st.markdown(
-        """
-**Рекомендую такой сценарий:**
-
-1. В корень репозитория кладёте **один стандартный файл** Лемана Про и называете его `lemanpro_rates.xlsx`.
-2. Пользователь открывает приложение и **загружает только файл товаров**.
-3. Если Лемана Про обновила тарифы или комиссии — вы просто **заменяете один файл** `lemanpro_rates.xlsx` в репозитории.
-4. Код при этом обычно менять не нужно.
-
-**Ручная загрузка файла в интерфейсе** нужна только как запасной вариант, если файл в репозитории временно не лежит.
-        """
+st.subheader("Файл товаров")
+col_t1, col_t2 = st.columns([2, 1])
+with col_t1:
+    product_file = st.file_uploader(
+        "Загрузите файл товаров",
+        type=["xlsx", "xls", "csv"],
+        help="Нужны поля: SKU, Наименование, Длина, Ширина, Высота, Вес, Себестоимость. Текущая цена — необязательно."
     )
-
-product_file = st.file_uploader(
-    "Файл товаров: SKU / Наименование / Длина / Ширина / Высота / Вес / Себестоимость / (необязательно) Текущая цена",
-    type=["xlsx", "xls", "csv"]
-)
-
-
-def read_products(uploaded_file):
-    if uploaded_file is None:
-        return pd.DataFrame()
-    if uploaded_file.name.lower().endswith(".csv"):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
-    rename_map = {}
-    for col in df.columns:
-        c = normalize_text(col)
-        if c in {"sku", "артикул", "артикул товара", "seller sku"}:
-            rename_map[col] = "sku"
-        elif c in {"наименование", "название", "наименование товара", "товар"}:
-            rename_map[col] = "name"
-        elif c in {"длина", "длина см", "length"}:
-            rename_map[col] = "length"
-        elif c in {"ширина", "ширина см", "width"}:
-            rename_map[col] = "width"
-        elif c in {"высота", "высота см", "height"}:
-            rename_map[col] = "height"
-        elif c in {"вес", "вес кг", "weight"}:
-            rename_map[col] = "weight"
-        elif c in {"себестоимость", "себес", "cost", "закупка"}:
-            rename_map[col] = "cost"
-        elif c in {"цена", "текущая цена", "price", "цена продажи"}:
-            rename_map[col] = "current_price"
-    df = df.rename(columns=rename_map)
-    required = ["sku", "name", "length", "width", "height", "weight", "cost"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"В файле товаров не хватает колонок: {', '.join(missing)}")
-    keep = required + (["current_price"] if "current_price" in df.columns else [])
-    return df[keep].copy()
-
+with col_t2:
+    st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+    st.download_button(
+        "Скачать шаблон Excel",
+        data=make_template_excel_bytes(),
+        file_name="lemanpro_products_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+    )
 
 products = pd.DataFrame()
 if product_file is not None:
@@ -409,10 +448,10 @@ if st.button("Рассчитать", type="primary", disabled=(ratebook is None 
     if total_share <= 0:
         st.error("Сумма долей зон должна быть больше 0%.")
         st.stop()
+
     msk_w = msk_share / total_share
     spb_w = spb_share / total_share
     reg_w = region_share / total_share
-
     buyout = buyout_rate / 100
     cancel_or_not_buyout = 1 - buyout
     post_buyout_return = return_after_buyout / 100
@@ -429,7 +468,6 @@ if st.button("Рассчитать", type="primary", disabled=(ratebook is None 
         weight_kg = normalize_weight(row["weight"], wt_unit)
         cost = safe_float(row["cost"])
         current_price = safe_float(row.get("current_price", 0.0), 0.0)
-
         volume_l = max(length_cm * width_cm * height_cm / 1000.0, 0.0)
 
         matched_row, score = classify_by_rules(name, commission_df)
@@ -450,7 +488,6 @@ if st.button("Рассчитать", type="primary", disabled=(ratebook is None 
         lm_msk = find_break_tariff(volume_l, last_mile_df, zone_from=warehouse_zone, zone_to="Москва и МО")
         lm_spb = find_break_tariff(volume_l, last_mile_df, zone_from=warehouse_zone, zone_to="СПБ и ЛО")
         lm_reg = find_break_tariff(volume_l, last_mile_df, zone_from=warehouse_zone, zone_to="Регионы")
-
         ret_lm_msk = find_break_tariff(volume_l, return_last_mile_df, zone_from=warehouse_zone, zone_to="Москва и МО")
         ret_lm_spb = find_break_tariff(volume_l, return_last_mile_df, zone_from=warehouse_zone, zone_to="СПБ и ЛО")
         ret_lm_reg = find_break_tariff(volume_l, return_last_mile_df, zone_from=warehouse_zone, zone_to="Регионы")
@@ -458,7 +495,6 @@ if st.button("Рассчитать", type="primary", disabled=(ratebook is None 
         avg_last_mile = lm_msk * msk_w + lm_spb * spb_w + lm_reg * reg_w
         avg_return_last_mile = ret_lm_msk * msk_w + ret_lm_spb * spb_w + ret_lm_reg * reg_w
 
-        # Ожидаемая логистика на 1 успешную продажу
         if scheme == "FBS":
             expected_logistics = (
                 to_sc + avg_last_mile
@@ -477,9 +513,11 @@ if st.button("Рассчитать", type="primary", disabled=(ratebook is None 
         tax, profit_after_tax, margin_after_tax = calc_tax(rec_price, total_costs_before_tax, tax_regime)
         profit_before_tax = rec_price - total_costs_before_tax
         margin_before_tax = (profit_before_tax / rec_price * 100) if rec_price > 0 else 0.0
-        markup_pct = ((rec_price / (cost + expected_logistics + extra_cost_per_unit)) - 1) * 100 if (cost + expected_logistics + extra_cost_per_unit) > 0 else 0.0
+        markup_base = cost + expected_logistics + extra_cost_per_unit
+        markup_pct = ((rec_price / markup_base) - 1) * 100 if markup_base > 0 else 0.0
 
-        current_profit_after_tax = current_margin_after_tax = None
+        current_profit_after_tax = None
+        current_margin_after_tax = None
         if current_price > 0:
             current_pct_costs = current_price * percent_costs_pct / 100
             current_total_costs = cost + expected_logistics + extra_cost_per_unit + current_pct_costs
@@ -537,8 +575,8 @@ if st.button("Рассчитать", type="primary", disabled=(ratebook is None 
     st.subheader("Результат")
     st.dataframe(result_df, use_container_width=True, height=650)
 
-    output = tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx")
-    with pd.ExcelWriter(output.name, engine="openpyxl") as writer:
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
         result_df.to_excel(writer, sheet_name="Результат", index=False)
         pd.DataFrame({
             "Параметр": [
@@ -552,11 +590,11 @@ if st.button("Рассчитать", type="primary", disabled=(ratebook is None 
                 buyout_rate, return_after_buyout, source_note or ""
             ]
         }).to_excel(writer, sheet_name="Параметры", index=False)
+    output.seek(0)
 
-    with open(output.name, "rb") as f:
-        st.download_button(
-            "Скачать результат Excel",
-            data=f.read(),
-            file_name="lemanpro_unit_economics.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
+    st.download_button(
+        "Скачать результат Excel",
+        data=output.getvalue(),
+        file_name="lemanpro_unit_economics.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
