@@ -1,1068 +1,619 @@
+
 import io
 import math
-import sqlite3
-from pathlib import Path
+import re
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
 
-st.set_page_config(
-    page_title="Лемана Про — юнит-экономика FBS / FBO",
-    layout="wide",
-    page_icon="📦",
-)
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
 
-DB_PATH = "lemanpro_products.db"
+
+st.set_page_config(page_title="Лемана Про — простая юнит-экономика", layout="wide", page_icon="📦")
 
 
 # =========================
-# DB
+# Helpers
 # =========================
-def init_db():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    cur = conn.cursor()
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS products (
-            sku TEXT PRIMARY KEY,
-            name TEXT,
-            template TEXT,
-            item_type TEXT,
-            subcategory TEXT,
-            category TEXT,
-            length_cm REAL DEFAULT 0,
-            width_cm REAL DEFAULT 0,
-            height_cm REAL DEFAULT 0,
-            weight_kg REAL DEFAULT 0,
-            cost_price REAL DEFAULT 0,
-            current_price REAL DEFAULT 0,
-            promo_price REAL DEFAULT 0,
-            region TEXT,
-            manual_commission REAL
-        )
-        """
-    )
-    conn.commit()
-    return conn
-
-
-# =========================
-# Utils
-# =========================
-def to_float(value, default=0.0):
-    if value is None:
-        return default
-    try:
-        if isinstance(value, str):
-            value = value.replace("\xa0", "").replace(" ", "").replace(",", ".").strip()
-            if value == "":
-                return default
-        return float(value)
-    except Exception:
-        return default
-
-
-def normalize_dimension(raw, unit: str) -> float:
-    value = to_float(raw, 0.0)
-    unit = (unit or "").strip().lower()
-    if unit in ("мм", "mm"):
-        return value / 10.0
-    if unit in ("м", "meter", "метр", "метры"):
-        return value * 100.0
-    return value
-
-
-def normalize_weight(raw, unit: str) -> float:
-    value = to_float(raw, 0.0)
-    unit = (unit or "").strip().lower()
-    if unit in ("г", "гр", "g", "gr"):
-        return value / 1000.0
-    return value
-
-
-def first_existing(row: pd.Series, names: List[str], default=None):
-    row_map = {str(k).strip().lower(): row[k] for k in row.index}
-    for n in names:
-        v = row_map.get(n.strip().lower())
-        if pd.notna(v):
-            return v
-    return default
-
 
 def clean_text(x) -> str:
-    if x is None or (isinstance(x, float) and math.isnan(x)):
+    if pd.isna(x):
         return ""
     return str(x).strip()
 
 
-def liters_from_dimensions(length_cm: float, width_cm: float, height_cm: float) -> float:
-    if min(length_cm, width_cm, height_cm) <= 0:
-        return 0.0
-    return (length_cm * width_cm * height_cm) / 1000.0
+def norm_text(x) -> str:
+    s = clean_text(x).lower().replace("ё", "е")
+    s = re.sub(r"[^a-zа-я0-9\s\-_/]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 
-def parse_bracket(text: str) -> Tuple[float, Optional[float]]:
-    s = clean_text(text).lower().replace(",", ".")
-    nums = []
-    current = ""
-    for ch in s:
-        if ch.isdigit() or ch == ".":
-            current += ch
-        else:
-            if current:
-                nums.append(float(current))
-                current = ""
-    if current:
-        nums.append(float(current))
-
-    if "от" in s and "+" in s:
-        low = nums[0] if nums else 0.0
-        return low, None
-    if "от" in s and "до" in s and len(nums) >= 2:
-        return nums[0], nums[1]
-    if len(nums) >= 2:
-        return nums[0], nums[1]
-    if len(nums) == 1:
-        return 0.0, nums[0]
-    return 0.0, None
+def to_float(x, default=0.0) -> float:
+    if pd.isna(x):
+        return default
+    s = str(x).strip().replace(" ", "").replace("%", "").replace(",", ".")
+    if not s:
+        return default
+    try:
+        return float(s)
+    except Exception:
+        return default
 
 
-def value_in_bracket(value: float, low: float, high: Optional[float]) -> bool:
-    if high is None:
-        return value >= low
-    return low <= value <= high
+def pick_col(df: pd.DataFrame, variants: List[str]) -> Optional[str]:
+    cols = {norm_text(c): c for c in df.columns}
+    for variant in variants:
+        key = norm_text(variant)
+        if key in cols:
+            return cols[key]
+    for c in df.columns:
+        c_norm = norm_text(c)
+        if any(norm_text(v) in c_norm for v in variants):
+            return c
+    return None
 
 
-def round_to_step(value: float, step: int) -> float:
+def parse_range_text(text: str) -> Tuple[float, Optional[float]]:
+    s = norm_text(text).replace("л.", " л")
+    nums = re.findall(r"\d+(?:[.,]\d+)?", s.replace(",", "."))
+    if not nums:
+        return 0.0, None
+    vals = [float(x) for x in nums]
+    if len(vals) == 1:
+        return vals[0], None
+    lo, hi = vals[0], vals[1]
+    if hi < lo:
+        lo, hi = hi, lo
+    return lo, hi
+
+
+def volume_l(length_cm: float, width_cm: float, height_cm: float) -> float:
+    return max(length_cm, 0) * max(width_cm, 0) * max(height_cm, 0) / 1000.0
+
+
+def round_price(x: float, step: int) -> float:
     if step <= 1:
-        return round(value, 2)
-    return float(int(math.ceil(max(value, 0.0) / step)) * step)
-
-
-def safe_mean(values: List[float]) -> float:
-    clean = [float(v) for v in values if v is not None]
-    return sum(clean) / len(clean) if clean else 0.0
+        return round(x, 2)
+    return math.ceil(x / step) * step
 
 
 # =========================
-# Tariff loading
+# Tax model
 # =========================
-@st.cache_data(show_spinner=False)
-def load_commissions(file_path: str) -> Dict[str, Dict[str, float]]:
-    xl = pd.ExcelFile(file_path)
-    sheet = "Комиссия_FBS и FBO"
-    if sheet not in xl.sheet_names:
-        raise ValueError(f"В файле нет листа '{sheet}'")
 
-    df = pd.read_excel(file_path, sheet_name=sheet)
-    df.columns = [clean_text(c) for c in df.columns]
-
-    result = {
-        "template": {},
-        "item_type": {},
-        "subcategory": {},
-        "category": {},
-    }
-
-    for _, row in df.iterrows():
-        commission_raw = to_float(first_existing(row, ["Комиссия"]), 0.0)
-        commission = commission_raw if commission_raw <= 1 else commission_raw / 100.0
-
-        template = clean_text(first_existing(row, ["Шаблон товара"]))
-        item_type = clean_text(first_existing(row, ["Тип товара"]))
-        subcategory = clean_text(first_existing(row, ["Подкатегория товара"]))
-        category = clean_text(first_existing(row, ["Категория"]))
-
-        if template:
-            result["template"][template.lower()] = commission
-        if item_type:
-            result["item_type"][item_type.lower()] = commission
-        if subcategory:
-            result["subcategory"][subcategory.lower()] = commission
-        if category:
-            result["category"][category.lower()] = commission
-
-    return result
+TAX_OPTIONS = {
+    "Без налога": ("none", 0.0),
+    "УСН Доходы 6%": ("revenue", 0.06),
+    "УСН Доходы-Расходы 15%": ("profit", 0.15),
+    "ОСНО 25% от прибыли": ("profit", 0.25),
+}
 
 
-@st.cache_data(show_spinner=False)
-def load_logistics(file_path: str):
-    xl = pd.ExcelFile(file_path)
-
-    zero_df = pd.read_excel(file_path, sheet_name="Тарифы (Доставка до СЦ)")
-    return_zero_df = pd.read_excel(file_path, sheet_name="Тарифы (Возврат Доставка до СЦ)")
-    last_mile_df = pd.read_excel(file_path, sheet_name="Тарифы (Последняя миля)")
-    return_last_mile_df = pd.read_excel(file_path, sheet_name="Тарифы (возврат Последняя миля)")
-    zones_df = pd.read_excel(file_path, sheet_name="Зоны (услуга Последняя миля)")
-
-    def build_simple_table(df):
-        rows = []
-        for _, row in df.iterrows():
-            bracket = clean_text(first_existing(row, ["Объемный брейк отправления, в л", "Объемный брейк отправления, в л."]))
-            tariff = to_float(first_existing(row, ["Тариф, с НДС"]), 0.0)
-            low, high = parse_bracket(bracket)
-            extra_per_l = tariff if ("от 120" in bracket.lower() and tariff > 0) else 0.0
-            base_tariff = 0.0 if ("от 120" in bracket.lower() and tariff > 0) else tariff
-            rows.append(
-                {
-                    "raw_bracket": bracket,
-                    "low": low,
-                    "high": high,
-                    "base_tariff": base_tariff,
-                    "extra_per_l": extra_per_l,
-                }
-            )
-        return rows
-
-    def build_last_mile_table(df):
-        rows = []
-        for _, row in df.iterrows():
-            origin_zone = int(to_float(first_existing(row, ["Зона откуда"]), 0))
-            dest_label = clean_text(first_existing(row, ["Зона куда"]))
-            bracket = clean_text(first_existing(row, ["Весовой брейк отправления, в л.", "Весовой брейк отправления, в л"]))
-            tariff = to_float(first_existing(row, ["Тариф, с НДС"]), 0.0)
-            extra_per_l = to_float(first_existing(row, ["+1 л, с НДС"]), 0.0)
-            low, high = parse_bracket(bracket)
-            rows.append(
-                {
-                    "origin_zone": origin_zone,
-                    "dest_label": dest_label,
-                    "raw_bracket": bracket,
-                    "low": low,
-                    "high": high,
-                    "base_tariff": tariff,
-                    "extra_per_l": extra_per_l,
-                }
-            )
-        return rows
-
-    zone_map = {}
-    for _, row in zones_df.iterrows():
-        region = clean_text(first_existing(row, ["Край/Область"]))
-        zone = int(to_float(first_existing(row, ["Зона"]), 0))
-        if region:
-            zone_map[region.lower()] = zone
-
-    return {
-        "zero_mile": build_simple_table(zero_df),
-        "return_zero_mile": build_simple_table(return_zero_df),
-        "last_mile": build_last_mile_table(last_mile_df),
-        "return_last_mile": build_last_mile_table(return_last_mile_df),
-        "zone_map": zone_map,
-    }
-
-
-def get_simple_tariff(brackets: List[dict], liters: float) -> float:
-    liters = max(liters, 0.0)
-    for row in brackets:
-        if value_in_bracket(liters, row["low"], row["high"]):
-            if row["high"] is None and row["extra_per_l"] > 0:
-                extra = max(liters - row["low"], 0.0)
-                return row["base_tariff"] + math.ceil(extra) * row["extra_per_l"]
-            return row["base_tariff"]
-    return 0.0
-
-
-def get_last_mile_tariff(table: List[dict], origin_zone: int, destination_label: str, liters: float) -> float:
-    destination_label = clean_text(destination_label)
-    liters = max(liters, 0.0)
-    candidates = [r for r in table if r["origin_zone"] == origin_zone and r["dest_label"] == destination_label]
-    for row in candidates:
-        if value_in_bracket(liters, row["low"], row["high"]):
-            if row["high"] is None and row["extra_per_l"] > 0:
-                extra = max(liters - row["low"], 0.0)
-                return row["base_tariff"] + math.ceil(extra) * row["extra_per_l"]
-            return row["base_tariff"]
-    return 0.0
-
-
-def get_region_group_labels(logistics_dict: dict, origin_zone: int) -> List[str]:
-    labels = []
-    for row in logistics_dict["last_mile"]:
-        if row["origin_zone"] == origin_zone:
-            label = clean_text(row["dest_label"])
-            if label and label not in labels:
-                labels.append(label)
-    return labels
-
-
-def build_fbs_zone_scenarios(logistics_dict: dict, origin_zone: int, share_moscow: float, share_spb: float, share_regions: float):
-    labels = get_region_group_labels(logistics_dict, origin_zone)
-    regional_labels = [x for x in labels if x not in {"Москва и МО", "СПБ и ЛО"}]
-    shares_total = max(share_moscow + share_spb + share_regions, 0.0001)
-    wm = share_moscow / shares_total
-    ws = share_spb / shares_total
-    wr = share_regions / shares_total
-
-    scenarios = {
-        "Москва и МО": {"weights": {"Москва и МО": 1.0}, "kind": "single"},
-        "СПБ и ЛО": {"weights": {"СПБ и ЛО": 1.0}, "kind": "single"},
-    }
-
-    if regional_labels:
-        regional_weight = 1.0 / len(regional_labels)
-        scenarios["Регионы (среднее)"] = {
-            "weights": {label: regional_weight for label in regional_labels},
-            "kind": "average_regions",
-        }
-    else:
-        scenarios["Регионы (среднее)"] = {
-            "weights": {},
-            "kind": "average_regions",
-        }
-
-    weighted = {}
-    if wm > 0:
-        weighted["Москва и МО"] = wm
-    if ws > 0:
-        weighted["СПБ и ЛО"] = ws
-    if wr > 0 and regional_labels:
-        regional_weight = wr / len(regional_labels)
-        for label in regional_labels:
-            weighted[label] = weighted.get(label, 0.0) + regional_weight
-    scenarios["Средневзвешенно"] = {"weights": weighted, "kind": "weighted"}
-    return scenarios
-
-
-# =========================
-# Commission lookup
-# =========================
-def get_commission(row: pd.Series, commission_dict: Dict[str, Dict[str, float]]) -> Tuple[float, str]:
-    manual = to_float(row.get("manual_commission"), -1)
-    if manual >= 0:
-        return (manual / 100.0 if manual > 1 else manual), "manual"
-
-    template = clean_text(row.get("template")).lower()
-    item_type = clean_text(row.get("item_type")).lower()
-    subcategory = clean_text(row.get("subcategory")).lower()
-    category = clean_text(row.get("category")).lower()
-
-    if template and template in commission_dict["template"]:
-        return commission_dict["template"][template], "template"
-    if item_type and item_type in commission_dict["item_type"]:
-        return commission_dict["item_type"][item_type], "item_type"
-    if subcategory and subcategory in commission_dict["subcategory"]:
-        return commission_dict["subcategory"][subcategory], "subcategory"
-    if category and category in commission_dict["category"]:
-        return commission_dict["category"][category], "category"
-    return 0.0, "not_found"
-
-
-# =========================
-# Taxes
-# =========================
-def calc_tax(price: float, profit_before_tax: float, regime: str) -> Tuple[float, float, float]:
-    price = max(price, 0.0)
-    profit_before_tax = float(profit_before_tax)
-
-    regimes = {
-        "ОСНО (налог на прибыль 25%)": ("profit", 0.25),
-        "УСН Доходы (6%)": ("revenue", 0.06),
-        "УСН Доходы-Расходы (15%)": ("profit", 0.15),
-        "АУСН Доходы (8%)": ("revenue", 0.08),
-        "АУСН Доходы-Расходы (20%)": ("profit", 0.20),
-        "Без налога": ("none", 0.0),
-    }
-
-    mode, rate = regimes.get(regime, ("none", 0.0))
-
+def calc_tax(revenue: float, costs_before_tax: float, regime: str) -> float:
+    mode, rate = TAX_OPTIONS.get(regime, ("none", 0.0))
+    profit_before_tax = revenue - costs_before_tax
+    if mode == "none":
+        return 0.0
     if mode == "revenue":
-        tax = price * rate
-    elif mode == "profit":
-        tax = max(profit_before_tax, 0.0) * rate
-    else:
-        tax = 0.0
-
-    profit_after_tax = profit_before_tax - tax
-    margin_after_tax = (profit_after_tax / price * 100) if price > 0 else 0.0
-    return round(tax, 2), round(profit_after_tax, 2), round(margin_after_tax, 2)
+        return max(revenue * rate, 0.0)
+    if mode == "profit":
+        return max(profit_before_tax, 0.0) * rate
+    return 0.0
 
 
 # =========================
-# Core math
+# Parsers for uploaded files
 # =========================
-def calc_expected_logistics_for_destination(
-    scheme: str,
-    chargeable_liters: float,
-    origin_zone: int,
-    destination_label: str,
-    logistics_dict: dict,
-    buyout_pct: float,
-    client_return_pct: float,
-    fbo_inbound_per_unit: float,
-):
-    zero_mile = get_simple_tariff(logistics_dict["zero_mile"], chargeable_liters)
-    return_zero_mile = get_simple_tariff(logistics_dict["return_zero_mile"], chargeable_liters)
-    last_mile = get_last_mile_tariff(logistics_dict["last_mile"], origin_zone, destination_label, chargeable_liters)
-    return_last_mile = get_last_mile_tariff(logistics_dict["return_last_mile"], origin_zone, destination_label, chargeable_liters)
 
-    buyout_rate = max(min(buyout_pct / 100.0, 0.9999), 0.0001)
-    cancel_rate = 1.0 - buyout_rate
-    client_return_rate = max(min(client_return_pct / 100.0, 1.0), 0.0)
+@dataclass
+class CommissionRule:
+    commission_pct: float
+    template: str
+    type_name: str
+    subcategory: str
+    category: str
+    search_blob: str
 
-    if scheme == "FBS":
-        expected_zero_mile = zero_mile / buyout_rate
-        expected_return_zero_mile = return_zero_mile * (cancel_rate / buyout_rate)
-    else:
-        expected_zero_mile = max(fbo_inbound_per_unit, 0.0)
-        expected_return_zero_mile = 0.0
 
-    expected_last_mile = last_mile / buyout_rate
-    expected_return_last_mile = (
-        return_last_mile * (cancel_rate / buyout_rate) +
-        return_last_mile * client_return_rate
+@st.cache_data(show_spinner=False)
+def load_commission_rules(file_bytes: bytes) -> List[CommissionRule]:
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+    sheet = None
+    for s in xl.sheet_names:
+        s_norm = norm_text(s)
+        if "комиссия" in s_norm and ("fbs" in s_norm or "fbo" in s_norm or "комиссия" == s_norm):
+            sheet = s
+            break
+    if sheet is None:
+        sheet = xl.sheet_names[0]
+
+    df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
+    col_comm = pick_col(df, ["Комиссия"])
+    col_template = pick_col(df, ["Шаблон товара"])
+    col_type = pick_col(df, ["Тип товара", "Категория товаров"])
+    col_sub = pick_col(df, ["Подкатегория товара", "Подкатегория товаров"])
+    col_cat = pick_col(df, ["Категория"])
+
+    rules: List[CommissionRule] = []
+    for _, row in df.iterrows():
+        commission_raw = to_float(row.get(col_comm, 0))
+        if commission_raw <= 0:
+            continue
+        commission_pct = commission_raw * 100 if commission_raw <= 1 else commission_raw
+        template = clean_text(row.get(col_template, ""))
+        type_name = clean_text(row.get(col_type, ""))
+        subcategory = clean_text(row.get(col_sub, ""))
+        category = clean_text(row.get(col_cat, ""))
+
+        blob = " | ".join([template, type_name, subcategory, category]).strip(" |")
+        if not blob:
+            continue
+
+        rules.append(
+            CommissionRule(
+                commission_pct=commission_pct,
+                template=template,
+                type_name=type_name,
+                subcategory=subcategory,
+                category=category,
+                search_blob=norm_text(blob),
+            )
+        )
+    return rules
+
+
+@st.cache_data(show_spinner=False)
+def load_logistics_tables(file_bytes: bytes):
+    xl = pd.ExcelFile(io.BytesIO(file_bytes))
+
+    sheet_last = None
+    sheet_zero = None
+
+    for s in xl.sheet_names:
+        s_norm = norm_text(s)
+        if "последняя миля" in s_norm and "возврат" not in s_norm:
+            sheet_last = s
+        if ("доставка до сц" in s_norm or "нулевая миля" in s_norm) and "возврат" not in s_norm:
+            sheet_zero = s
+
+    if sheet_last is None:
+        raise ValueError("Не найден лист с тарифами последней мили.")
+    if sheet_zero is None:
+        raise ValueError("Не найден лист с тарифами нулевой мили / доставки до СЦ.")
+
+    last_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_last)
+    zero_df = pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_zero)
+
+    # zero mile
+    zero_range_col = pick_col(zero_df, ["Объемный брейк отправления, в л"])
+    zero_tariff_col = pick_col(zero_df, ["Тариф, с НДС"])
+    zero_rows = []
+    for _, row in zero_df.iterrows():
+        lo, hi = parse_range_text(clean_text(row.get(zero_range_col, "")))
+        tariff = to_float(row.get(zero_tariff_col, 0))
+        if hi is None:
+            hi = float("inf")
+        if tariff > 0:
+            zero_rows.append((lo, hi, tariff))
+    zero_rows = sorted(zero_rows, key=lambda x: (x[0], x[1]))
+
+    # last mile
+    col_from = pick_col(last_df, ["Зона откуда"])
+    col_to = pick_col(last_df, ["Зона куда"])
+    col_break = pick_col(last_df, ["Весовой брейк отправления, в л", "Весовой брейк отправления, в л."])
+    col_tariff = pick_col(last_df, ["Тариф, с НДС"])
+    col_plus = pick_col(last_df, ["+1 л, с НДС"])
+
+    last_rows = []
+    for _, row in last_df.iterrows():
+        zone_from = clean_text(row.get(col_from, ""))
+        zone_to = clean_text(row.get(col_to, ""))
+        lo, hi = parse_range_text(clean_text(row.get(col_break, "")))
+        tariff = to_float(row.get(col_tariff, 0))
+        plus_per_l = to_float(row.get(col_plus, 0))
+        if hi is None:
+            hi = float("inf")
+        if zone_to and tariff > 0:
+            last_rows.append((zone_from, zone_to, lo, hi, tariff, plus_per_l))
+
+    return zero_rows, last_rows
+
+
+def get_zero_mile_cost(v_l: float, zero_rows) -> float:
+    for lo, hi, tariff in zero_rows:
+        if v_l >= lo and v_l <= hi:
+            return tariff
+    if zero_rows:
+        lo, hi, tariff = zero_rows[-1]
+        extra = max(v_l - hi, 0) if math.isfinite(hi) else 0
+        return tariff + extra * 0
+    return 0.0
+
+
+def get_last_mile_cost(v_l: float, zone_to: str, origin_zone: int, last_rows) -> float:
+    zone_to_norm = norm_text(zone_to)
+    candidates = []
+    for z_from, z_to, lo, hi, tariff, plus_per_l in last_rows:
+        same_from = str(origin_zone) == str(z_from).strip() if clean_text(z_from) else True
+        if same_from and norm_text(z_to) == zone_to_norm:
+            candidates.append((lo, hi, tariff, plus_per_l))
+    if not candidates:
+        for z_from, z_to, lo, hi, tariff, plus_per_l in last_rows:
+            if norm_text(z_to) == zone_to_norm:
+                candidates.append((lo, hi, tariff, plus_per_l))
+    candidates = sorted(candidates, key=lambda x: (x[0], x[1]))
+    for lo, hi, tariff, plus_per_l in candidates:
+        if v_l >= lo and v_l <= hi:
+            return tariff
+    if candidates:
+        lo, hi, tariff, plus_per_l = candidates[-1]
+        if math.isfinite(hi) and plus_per_l > 0 and v_l > hi:
+            return tariff + (v_l - hi) * plus_per_l
+        return tariff
+    return 0.0
+
+
+# =========================
+# Category detection
+# =========================
+
+def detect_category_by_rules(name: str, rules: List[CommissionRule]) -> Optional[CommissionRule]:
+    name_norm = norm_text(name)
+    if not name_norm:
+        return None
+
+    scored = []
+    name_words = set(name_norm.split())
+
+    for rule in rules:
+        score = 0
+        blob = rule.search_blob
+        if not blob:
+            continue
+
+        template_words = set(blob.split())
+
+        # exact/substring
+        if rule.template and norm_text(rule.template) in name_norm:
+            score += 50
+        if rule.type_name and norm_text(rule.type_name) in name_norm:
+            score += 30
+        if rule.subcategory and norm_text(rule.subcategory) in name_norm:
+            score += 20
+        if rule.category and norm_text(rule.category) in name_norm:
+            score += 10
+
+        # token overlap
+        overlap = len(name_words & template_words)
+        score += overlap * 2
+
+        if score > 0:
+            scored.append((score, rule))
+
+    if not scored:
+        return None
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[0][1]
+
+
+def detect_category_ai(name: str, rules: List[CommissionRule], api_key: str) -> Optional[CommissionRule]:
+    if not api_key or OpenAI is None or not rules:
+        return None
+    variants = []
+    for i, r in enumerate(rules[:400], start=1):
+        label = " | ".join(x for x in [r.template, r.type_name, r.subcategory, r.category] if x)
+        variants.append(f"{i}. {label} -> {r.commission_pct:.2f}%")
+    prompt = (
+        "Ты классификатор товаров для Лемана Про.\n"
+        "Выбери один самый подходящий вариант категории для товара.\n"
+        "Ответь только номером варианта.\n\n"
+        f"Товар: {name}\n\n"
+        "Варианты:\n" + "\n".join(variants)
     )
+    try:
+        client = OpenAI(api_key=api_key)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Ты выбираешь один лучший вариант категории товара."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            max_tokens=10,
+        )
+        answer = clean_text(resp.choices[0].message.content)
+        m = re.search(r"\d+", answer)
+        if not m:
+            return None
+        idx = int(m.group(0)) - 1
+        if 0 <= idx < len(rules[:400]):
+            return rules[idx]
+    except Exception:
+        return None
+    return None
 
+
+# =========================
+# Price solver
+# =========================
+
+def economics_at_price(
+    price: float,
+    commission_pct: float,
+    expected_logistics: float,
+    cost: float,
+    acquiring_pct: float,
+    marketing_pct: float,
+    extra_cost: float,
+    tax_regime: str,
+):
+    pct_costs = (commission_pct + acquiring_pct + marketing_pct) / 100.0
+    revenue = price
+    variable_pct_costs = revenue * pct_costs
+    costs_before_tax = cost + expected_logistics + extra_cost + variable_pct_costs
+    tax = calc_tax(revenue, costs_before_tax, tax_regime)
+    profit_after_tax = revenue - costs_before_tax - tax
+    margin_after_tax = (profit_after_tax / revenue * 100.0) if revenue > 0 else 0.0
+    markup = ((price / cost - 1.0) * 100.0) if cost > 0 else 0.0
     return {
-        "expected_zero_mile": expected_zero_mile,
-        "expected_return_zero_mile": expected_return_zero_mile,
-        "expected_last_mile": expected_last_mile,
-        "expected_return_last_mile": expected_return_last_mile,
-        "logistics_total": expected_zero_mile + expected_return_zero_mile + expected_last_mile + expected_return_last_mile,
-    }
-
-
-def build_metrics_for_price(price: float, fixed_costs: float, variable_pct: float, cost_price: float, tax_regime: str):
-    price = max(price, 0.0)
-    variable_costs = price * variable_pct
-    profit_before_tax = price - fixed_costs - variable_costs
-    margin_before_tax = (profit_before_tax / price * 100) if price > 0 else 0.0
-    tax, profit_after_tax, margin_after_tax = calc_tax(price, profit_before_tax, tax_regime)
-    markup_pct = ((price / cost_price - 1) * 100) if cost_price > 0 else 0.0
-    return {
-        "price": round(price, 2),
-        "variable_costs": round(variable_costs, 2),
-        "profit_before_tax": round(profit_before_tax, 2),
-        "margin_before_tax": round(margin_before_tax, 2),
+        "revenue": revenue,
+        "variable_pct_costs": variable_pct_costs,
+        "costs_before_tax": costs_before_tax,
         "tax": tax,
         "profit_after_tax": profit_after_tax,
         "margin_after_tax": margin_after_tax,
-        "markup_pct": round(markup_pct, 2),
+        "markup_pct": markup,
     }
 
 
-def calculate_unit_metrics(
-    row: pd.Series,
-    scheme: str,
-    tax_regime: str,
-    commission_dict: Dict[str, Dict[str, float]],
-    logistics_dict: dict,
-    origin_zone: int,
-    acquiring_pct: float,
-    payout_pct: float,
-    marketing_pct: float,
-    other_mp_pct: float,
-    packing_rub: float,
-    other_fixed_rub: float,
-    fbo_inbound_per_unit: float,
-    buyout_pct: float,
-    client_return_pct: float,
+def solve_recommended_price(
     target_margin_pct: float,
-    round_price_step: int,
-    zone_shares: Tuple[float, float, float],
-) -> dict:
-    commission_pct, commission_source = get_commission(row, commission_dict)
+    commission_pct: float,
+    expected_logistics: float,
+    cost: float,
+    acquiring_pct: float,
+    marketing_pct: float,
+    extra_cost: float,
+    tax_regime: str,
+    rounding_step: int,
+) -> float:
+    # binary search on price that gives target margin after tax
+    low = max(cost + expected_logistics + extra_cost, 1.0)
+    high = max(low * 5, 100.0)
+    for _ in range(40):
+        e = economics_at_price(high, commission_pct, expected_logistics, cost, acquiring_pct, marketing_pct, extra_cost, tax_regime)
+        if e["margin_after_tax"] >= target_margin_pct:
+            break
+        high *= 1.8
 
-    cost_price = to_float(row.get("cost_price"), 0.0)
-    current_price = to_float(row.get("current_price"), 0.0)
-    promo_price = to_float(row.get("promo_price"), 0.0)
-
-    length_cm = to_float(row.get("length_cm"), 0.0)
-    width_cm = to_float(row.get("width_cm"), 0.0)
-    height_cm = to_float(row.get("height_cm"), 0.0)
-    weight_kg = to_float(row.get("weight_kg"), 0.0)
-
-    liters = liters_from_dimensions(length_cm, width_cm, height_cm)
-    chargeable_liters = liters if liters > 0 else weight_kg
-
-    variable_pct = commission_pct + acquiring_pct / 100.0 + payout_pct / 100.0 + marketing_pct / 100.0 + other_mp_pct / 100.0
-    base_price = promo_price if promo_price > 0 else current_price
-
-    zone_data = {}
-
-    if scheme == "FBS":
-        scenario_map = build_fbs_zone_scenarios(
-            logistics_dict,
-            origin_zone,
-            zone_shares[0],
-            zone_shares[1],
-            zone_shares[2],
-        )
-
-        for scenario_name, scenario in scenario_map.items():
-            weights = scenario["weights"]
-            if not weights:
-                logistics_total = 0.0
-                ez = erz = el = erl = 0.0
-            else:
-                weighted_parts = []
-                for dest_label, weight in weights.items():
-                    lg = calc_expected_logistics_for_destination(
-                        scheme=scheme,
-                        chargeable_liters=chargeable_liters,
-                        origin_zone=origin_zone,
-                        destination_label=dest_label,
-                        logistics_dict=logistics_dict,
-                        buyout_pct=buyout_pct,
-                        client_return_pct=client_return_pct,
-                        fbo_inbound_per_unit=fbo_inbound_per_unit,
-                    )
-                    weighted_parts.append((lg, weight))
-                ez = sum(item[0]["expected_zero_mile"] * item[1] for item in weighted_parts)
-                erz = sum(item[0]["expected_return_zero_mile"] * item[1] for item in weighted_parts)
-                el = sum(item[0]["expected_last_mile"] * item[1] for item in weighted_parts)
-                erl = sum(item[0]["expected_return_last_mile"] * item[1] for item in weighted_parts)
-                logistics_total = sum(item[0]["logistics_total"] * item[1] for item in weighted_parts)
-
-            fixed_costs = cost_price + logistics_total + packing_rub + other_fixed_rub
-            denom = 1.0 - variable_pct - target_margin_pct / 100.0
-            recommended_price_raw = fixed_costs / denom if denom > 0 else 0.0
-            recommended_price = round_to_step(recommended_price_raw, round_price_step)
-
-            current_metrics = build_metrics_for_price(base_price, fixed_costs, variable_pct, cost_price, tax_regime)
-            recommended_metrics = build_metrics_for_price(recommended_price, fixed_costs, variable_pct, cost_price, tax_regime)
-            zone_data[scenario_name] = {
-                "zero_mile": round(ez, 2),
-                "return_zero_mile": round(erz, 2),
-                "last_mile": round(el, 2),
-                "return_last_mile": round(erl, 2),
-                "logistics_total": round(logistics_total, 2),
-                "recommended_price": round(recommended_price, 2),
-                "recommended_price_raw": round(recommended_price_raw, 2),
-                "current_metrics": current_metrics,
-                "recommended_metrics": recommended_metrics,
-                "denom": denom,
-            }
-
-        primary = zone_data.get("Средневзвешенно", zone_data.get("Москва и МО"))
-    else:
-        lg = calc_expected_logistics_for_destination(
-            scheme=scheme,
-            chargeable_liters=chargeable_liters,
-            origin_zone=origin_zone,
-            destination_label="Москва и МО",
-            logistics_dict=logistics_dict,
-            buyout_pct=buyout_pct,
-            client_return_pct=client_return_pct,
-            fbo_inbound_per_unit=fbo_inbound_per_unit,
-        )
-        logistics_total = lg["logistics_total"]
-        fixed_costs = cost_price + logistics_total + packing_rub + other_fixed_rub
-        denom = 1.0 - variable_pct - target_margin_pct / 100.0
-        recommended_price_raw = fixed_costs / denom if denom > 0 else 0.0
-        recommended_price = round_to_step(recommended_price_raw, round_price_step)
-
-        primary = {
-            "zero_mile": round(lg["expected_zero_mile"], 2),
-            "return_zero_mile": round(lg["expected_return_zero_mile"], 2),
-            "last_mile": round(lg["expected_last_mile"], 2),
-            "return_last_mile": round(lg["expected_return_last_mile"], 2),
-            "logistics_total": round(logistics_total, 2),
-            "recommended_price": round(recommended_price, 2),
-            "recommended_price_raw": round(recommended_price_raw, 2),
-            "current_metrics": build_metrics_for_price(base_price, fixed_costs, variable_pct, cost_price, tax_regime),
-            "recommended_metrics": build_metrics_for_price(recommended_price, fixed_costs, variable_pct, cost_price, tax_regime),
-            "denom": denom,
-        }
-        zone_data = {
-            "Средневзвешенно": primary,
-            "Москва и МО": primary,
-            "СПБ и ЛО": primary,
-            "Регионы (среднее)": primary,
-        }
-
-    bad_flag = ""
-    if commission_source == "not_found":
-        bad_flag = "Нет комиссии"
-    elif primary["denom"] <= 0:
-        bad_flag = "Целевая маржа недостижима"
-    elif primary["current_metrics"]["profit_after_tax"] < 0:
-        bad_flag = "Убыточно"
-    elif primary["current_metrics"]["margin_before_tax"] < target_margin_pct:
-        bad_flag = "Ниже цели"
-
-    weighted_current = primary["current_metrics"]
-    weighted_recommended = primary["recommended_metrics"]
-
-    return {
-        "SKU": clean_text(row.get("sku")),
-        "Название": clean_text(row.get("name")),
-        "Схема": scheme,
-        "Объем, л": round(chargeable_liters, 3),
-        "Вес, кг": round(weight_kg, 3),
-        "Себестоимость, руб": round(cost_price, 2),
-        "Текущая цена, руб": round(current_price, 2),
-        "Цена акции, руб": round(promo_price, 2),
-        "Цена расчета, руб": weighted_current["price"],
-        "Комиссия, %": round(commission_pct * 100, 2),
-        "Источник комиссии": commission_source,
-        "Нулевая миля (средняя), руб": primary["zero_mile"],
-        "Возврат нулевой мили (средняя), руб": primary["return_zero_mile"],
-        "Последняя миля (средняя), руб": primary["last_mile"],
-        "Возврат последней мили (средняя), руб": primary["return_last_mile"],
-        "Логистика итого (средняя), руб": primary["logistics_total"],
-        "Переменные расходы, руб": weighted_current["variable_costs"],
-        "Прибыль до налога (текущая), руб": weighted_current["profit_before_tax"],
-        "Маржа до налога (текущая), %": weighted_current["margin_before_tax"],
-        "Налог (текущая), руб": weighted_current["tax"],
-        "Прибыль после налога (текущая), руб": weighted_current["profit_after_tax"],
-        "Маржа после налога (текущая), %": weighted_current["margin_after_tax"],
-        "Наценка (текущая), %": weighted_current["markup_pct"],
-        "Рекоменд. цена Москва и МО, руб": zone_data["Москва и МО"]["recommended_price"],
-        "Рекоменд. цена СПБ и ЛО, руб": zone_data["СПБ и ЛО"]["recommended_price"],
-        "Рекоменд. цена Регионы, руб": zone_data["Регионы (среднее)"]["recommended_price"],
-        "Рекоменд. цена средняя, руб": zone_data["Средневзвешенно"]["recommended_price"],
-        "Логистика Москва и МО, руб": zone_data["Москва и МО"]["logistics_total"],
-        "Логистика СПБ и ЛО, руб": zone_data["СПБ и ЛО"]["logistics_total"],
-        "Логистика Регионы, руб": zone_data["Регионы (среднее)"]["logistics_total"],
-        "Рекоменд. цена к публикации, руб": weighted_recommended["price"],
-        "Прибыль до налога (рекоменд.), руб": weighted_recommended["profit_before_tax"],
-        "Маржа до налога (рекоменд.), %": weighted_recommended["margin_before_tax"],
-        "Налог (рекоменд.), руб": weighted_recommended["tax"],
-        "Прибыль после налога (рекоменд.), руб": weighted_recommended["profit_after_tax"],
-        "Маржа после налога (рекоменд.), %": weighted_recommended["margin_after_tax"],
-        "Наценка (рекоменд.), %": weighted_recommended["markup_pct"],
-        "Флаг": bad_flag,
-    }
-
-
-# =========================
-# Excel export
-# =========================
-def autofit_worksheet(ws):
-    widths = {}
-    for row in ws.iter_rows():
-        for cell in row:
-            value = "" if cell.value is None else str(cell.value)
-            widths[cell.column] = max(widths.get(cell.column, 0), min(len(value) + 2, 40))
-    for col_idx, width in widths.items():
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-
-def apply_table_style(ws, freeze_cell="A2"):
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    thin = Side(style="thin", color="D9E2F3")
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = Border(bottom=thin)
-    ws.freeze_panes = freeze_cell
-    ws.auto_filter.ref = ws.dimensions
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-
-def set_number_formats(ws):
-    currency_keywords = ["руб", "цена", "логистика", "прибыль", "налог", "себестоимость", "расходы"]
-    pct_keywords = ["%", "маржа", "комиссия", "наценка"]
-    for col_idx, cell in enumerate(ws[1], start=1):
-        header = str(cell.value).lower() if cell.value else ""
-        if any(k in header for k in currency_keywords):
-            fmt = '#,##0.00;[Red](#,##0.00);-'
-        elif any(k in header for k in pct_keywords):
-            fmt = '0.00;[Red](0.00);-'
+    for _ in range(80):
+        mid = (low + high) / 2
+        e = economics_at_price(mid, commission_pct, expected_logistics, cost, acquiring_pct, marketing_pct, extra_cost, tax_regime)
+        if e["margin_after_tax"] >= target_margin_pct:
+            high = mid
         else:
-            fmt = None
-        if fmt:
-            for data_cell in ws.iter_cols(min_col=col_idx, max_col=col_idx, min_row=2, max_row=ws.max_row):
-                for c in data_cell:
-                    if isinstance(c.value, (int, float)):
-                        c.number_format = fmt
-
-
-def write_dataframe_sheet(ws, df: pd.DataFrame, sheet_name: str):
-    ws.title = sheet_name
-    ws.append(list(df.columns))
-    for row in df.itertuples(index=False, name=None):
-        ws.append(list(row))
-    apply_table_style(ws)
-    set_number_formats(ws)
-    autofit_worksheet(ws)
-
-
-def dataframe_to_excel_bytes(result_df: pd.DataFrame, template_df: pd.DataFrame, kpi_df: pd.DataFrame) -> bytes:
-    wb = Workbook()
-    ws_kpi = wb.active
-    write_dataframe_sheet(ws_kpi, kpi_df, "KPI")
-    ws_results = wb.create_sheet("Результат")
-    write_dataframe_sheet(ws_results, result_df, "Результат")
-    ws_template = wb.create_sheet("Шаблон")
-    write_dataframe_sheet(ws_template, template_df, "Шаблон")
-
-    output = io.BytesIO()
-    wb.save(output)
-    return output.getvalue()
+            low = mid
+    return round_price(high, rounding_step)
 
 
 # =========================
 # UI
 # =========================
-conn = init_db()
 
-st.title("Лемана Про — единый калькулятор юнит-экономики")
-st.caption("Поддержка схем FBS и FBO. Комиссии и тарифы загружаются из актуальных Excel-файлов Лемана Про.")
+st.title("Лемана Про — простая юнит-экономика")
+st.caption("Загрузите каталог, при необходимости загрузите файл тарифов/комиссий, и получите одну рекомендованную цену продажи.")
 
 with st.sidebar:
-    st.header("Параметры модели")
-
-    scheme = st.radio("Схема работы", ["FBS", "FBO"], horizontal=True)
-
-    tax_regime = st.selectbox(
-        "Налоговый режим",
-        [
-            "ОСНО (налог на прибыль 25%)",
-            "УСН Доходы (6%)",
-            "УСН Доходы-Расходы (15%)",
-            "АУСН Доходы (8%)",
-            "АУСН Доходы-Расходы (20%)",
-            "Без налога",
-        ],
-    )
-
-    st.divider()
-    st.subheader("Процентные расходы")
-    target_margin_pct = st.slider("Целевая маржа до налога, %", 0, 80, 20)
+    st.subheader("Параметры расчета")
+    tax_regime = st.selectbox("Налог", list(TAX_OPTIONS.keys()), index=0)
+    target_margin_pct = st.slider("Целевая маржа после налога, %", 0, 60, 20)
     acquiring_pct = st.number_input("Эквайринг, %", min_value=0.0, max_value=10.0, value=1.5, step=0.1)
-    payout_pct = st.number_input("Ранняя выплата / фин. услуги, %", min_value=0.0, max_value=10.0, value=0.0, step=0.1)
-    marketing_pct = st.number_input("Маркетинг / реклама, %", min_value=0.0, max_value=50.0, value=5.0, step=0.1)
-    other_mp_pct = st.number_input("Прочие % маркетплейса, %", min_value=0.0, max_value=50.0, value=0.0, step=0.1)
+    marketing_pct = st.number_input("Маркетинг / реклама, %", min_value=0.0, max_value=30.0, value=0.0, step=0.1)
+    extra_cost = st.number_input("Прочие расходы на 1 шт., руб", min_value=0.0, max_value=100000.0, value=0.0, step=10.0)
+    rounding_step = st.selectbox("Округление цены, руб", [1, 5, 10, 50, 100], index=2)
 
     st.divider()
-    st.subheader("Фиксированные расходы")
-    packing_rub = st.number_input("Упаковка на ед., руб", min_value=0.0, max_value=5000.0, value=0.0, step=10.0)
-    other_fixed_rub = st.number_input("Прочие фикс. расходы на ед., руб", min_value=0.0, max_value=5000.0, value=0.0, step=10.0)
-    if scheme == "FBO":
-        fbo_inbound_per_unit = st.number_input(
-            "Входящая логистика FBO на ед., руб",
-            min_value=0.0,
-            max_value=10000.0,
-            value=0.0,
-            step=10.0,
-            help="Для FBO обычно корректнее задавать усредненную входящую логистику на единицу отдельно.",
-        )
-    else:
-        fbo_inbound_per_unit = 0.0
+    st.subheader("FBS — настройки логистики")
+    origin_zone = st.number_input("Зона откуда (Москва склад = 9)", min_value=1, max_value=20, value=9, step=1)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        share_moscow = st.number_input("Москва/МО, %", min_value=0.0, max_value=100.0, value=70.0, step=1.0)
+    with c2:
+        share_spb = st.number_input("СПБ/ЛО, %", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
+    with c3:
+        share_regions = st.number_input("Регионы, %", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
 
     st.divider()
-    st.subheader("Поведенческие параметры")
-    buyout_pct = st.slider("Выкуп, %", 1, 100, 95)
-    client_return_pct = st.slider("Возвраты после выкупа, %", 0, 100, 5)
+    st.subheader("Категоризация")
+    use_ai = st.checkbox("Использовать OpenAI, если ключ есть", value=False)
+    openai_key = st.text_input("OpenAI API key", type="password", value=st.secrets.get("OPENAI_API_KEY", "") if hasattr(st, "secrets") else "")
 
-    st.divider()
-    st.subheader("Логистика")
-    origin_zone = st.number_input("Зона откуда", min_value=1, max_value=10, value=9, step=1, help="Для склада Москва / МО обычно это зона 9, если тарифный файл не менялся.")
-    round_price_step = st.selectbox("Округлять рекомендованную цену до", [1, 5, 10, 50, 100], index=2)
-
-    if scheme == "FBS":
-        st.divider()
-        st.subheader("Средняя модель зон FBS")
-        share_moscow = st.number_input("Доля заказов Москва и МО, %", min_value=0.0, max_value=100.0, value=70.0, step=1.0)
-        share_spb = st.number_input("Доля заказов СПБ и ЛО, %", min_value=0.0, max_value=100.0, value=20.0, step=1.0)
-        share_regions = st.number_input("Доля заказов регионы, %", min_value=0.0, max_value=100.0, value=10.0, step=1.0)
-    else:
-        share_moscow, share_spb, share_regions = 0.0, 0.0, 0.0
-
-st.markdown("### 1. Файлы тарифов и комиссий")
-col_a, col_b = st.columns(2)
-with col_a:
-    commission_file = st.file_uploader(
-        "Файл комиссий Лемана Про",
-        type=["xlsx"],
-        key="commission_file",
-        help="Нужен лист 'Комиссия_FBS и FBO'.",
-    )
-with col_b:
-    logistics_file = st.file_uploader(
-        "Файл логистики Лемана Про",
-        type=["xlsx"],
-        key="logistics_file",
-        help="Нужны листы 'Тарифы (Последняя миля)', 'Тарифы (возврат Последняя миля)', 'Тарифы (Доставка до СЦ)', 'Тарифы (Возврат Доставка до СЦ)', 'Зоны (услуга Последняя миля)'.",
-    )
-
-if not commission_file or not logistics_file:
-    st.info("Сначала загрузите оба файла Лемана Про: комиссии и логистику.")
+zone_sum = share_moscow + share_spb + share_regions
+if zone_sum <= 0:
+    st.error("Сумма долей зон должна быть больше 0%.")
     st.stop()
 
-try:
-    commission_dict = load_commissions(commission_file)
-    logistics_dict = load_logistics(logistics_file)
-except Exception as e:
-    st.error(f"Не удалось прочитать тарифные файлы: {e}")
-    st.stop()
+zone_weights = {
+    "Москва и МО": share_moscow / zone_sum,
+    "СПБ и ЛО": share_spb / zone_sum,
+    "Регионы": share_regions / zone_sum,
+}
 
-st.success("Файлы Лемана Про успешно загружены.")
+st.subheader("1. Загрузите файлы")
+catalog_file = st.file_uploader("Каталог товаров Excel: артикул, наименование, длина, ширина, высота, вес, себестоимость", type=["xlsx", "xls"])
+commission_file = st.file_uploader("Файл комиссий Excel", type=["xlsx", "xls"])
+logistics_file = st.file_uploader("Файл логистики Excel", type=["xlsx", "xls"])
 
-st.markdown("### 2. Каталог товаров")
-dim_col, wt_col = st.columns(2)
-with dim_col:
-    dim_unit = st.selectbox("Единица размеров в файле каталога", ["см", "мм", "м"], index=0)
-with wt_col:
-    wt_unit = st.selectbox("Единица веса в файле каталога", ["кг", "г"], index=0)
-
-catalog_file = st.file_uploader(
-    "Загрузить каталог Excel",
-    type=["xlsx"],
-    key="catalog_file",
-    help="Поддерживаются: SKU/Артикул, Название/Наименование, Шаблон товара, Тип товара, Подкатегория товара, Категория, Длина, Ширина, Высота, Вес, Себестоимость, Текущая цена, Цена акции, Регион.",
+st.info(
+    "Минимум нужен каталог. "
+    "Если не загрузить тарифы и комиссии, приложение не сможет корректно посчитать результат."
 )
 
-if catalog_file:
+if catalog_file and commission_file and logistics_file:
     try:
-        df = pd.read_excel(catalog_file)
-        save_rows = []
-        for _, row in df.iterrows():
-            sku = clean_text(first_existing(row, ["SKU", "Артикул", "Артикул продавца"]))
-            name = clean_text(first_existing(row, ["Название", "Наименование", "Товар"]))
-            if not sku:
-                continue
-
-            save_rows.append(
-                (
-                    sku,
-                    name,
-                    clean_text(first_existing(row, ["Шаблон товара", "Шаблон"])),
-                    clean_text(first_existing(row, ["Тип товара"])),
-                    clean_text(first_existing(row, ["Подкатегория товара", "Подкатегория"])),
-                    clean_text(first_existing(row, ["Категория"])),
-                    normalize_dimension(first_existing(row, ["Длина", "Длина, см", "Длина, мм"]), dim_unit),
-                    normalize_dimension(first_existing(row, ["Ширина", "Ширина, см", "Ширина, мм"]), dim_unit),
-                    normalize_dimension(first_existing(row, ["Высота", "Высота, см", "Высота, мм"]), dim_unit),
-                    normalize_weight(first_existing(row, ["Вес", "Вес, кг", "Вес, г"]), wt_unit),
-                    to_float(first_existing(row, ["Себестоимость", "Себес", "Закупка"]), 0.0),
-                    to_float(first_existing(row, ["Текущая цена", "Цена", "Цена без акции"]), 0.0),
-                    to_float(first_existing(row, ["Цена акции", "Акционная цена", "Цена со скидкой"]), 0.0),
-                    clean_text(first_existing(row, ["Регион", "Область", "Край/Область"])),
-                    None,
-                )
-            )
-
-        if save_rows:
-            conn.executemany(
-                """
-                INSERT INTO products (
-                    sku, name, template, item_type, subcategory, category,
-                    length_cm, width_cm, height_cm, weight_kg,
-                    cost_price, current_price, promo_price, region, manual_commission
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(sku) DO UPDATE SET
-                    name=excluded.name,
-                    template=excluded.template,
-                    item_type=excluded.item_type,
-                    subcategory=excluded.subcategory,
-                    category=excluded.category,
-                    length_cm=excluded.length_cm,
-                    width_cm=excluded.width_cm,
-                    height_cm=excluded.height_cm,
-                    weight_kg=excluded.weight_kg,
-                    cost_price=excluded.cost_price,
-                    current_price=excluded.current_price,
-                    promo_price=excluded.promo_price,
-                    region=excluded.region
-                """,
-                save_rows,
-            )
-            conn.commit()
-            st.success(f"Загружено / обновлено SKU: {len(save_rows)}")
+        rules = load_commission_rules(commission_file.getvalue())
+        zero_rows, last_rows = load_logistics_tables(logistics_file.getvalue())
     except Exception as e:
-        st.error(f"Ошибка загрузки каталога: {e}")
+        st.error(f"Ошибка чтения файлов комиссий/логистики: {e}")
+        st.stop()
 
-catalog_df = pd.read_sql_query("SELECT * FROM products ORDER BY sku", conn)
+    try:
+        catalog = pd.read_excel(catalog_file)
+    except Exception as e:
+        st.error(f"Ошибка чтения каталога: {e}")
+        st.stop()
 
-if catalog_df.empty:
-    st.warning("Каталог пока пуст. Загрузите Excel с товарами.")
-    st.stop()
+    col_sku = pick_col(catalog, ["Артикул", "SKU", "sku"])
+    col_name = pick_col(catalog, ["Наименование", "Название", "Товар"])
+    col_len = pick_col(catalog, ["Длина"])
+    col_wid = pick_col(catalog, ["Ширина"])
+    col_hei = pick_col(catalog, ["Высота"])
+    col_wgt = pick_col(catalog, ["Вес"])
+    col_cost = pick_col(catalog, ["Себестоимость", "Закупка", "Себес"])
 
-st.markdown("#### Ручная корректировка каталога и комиссий")
-editable = catalog_df.copy()
-editable["manual_commission"] = editable["manual_commission"].fillna("")
-edited = st.data_editor(
-    editable,
-    use_container_width=True,
-    num_rows="dynamic",
-    hide_index=True,
-    column_config={
-        "manual_commission": st.column_config.NumberColumn("Комиссия вручную, %", min_value=0.0, max_value=100.0, step=0.1),
-        "current_price": st.column_config.NumberColumn("Текущая цена, руб", min_value=0.0, step=1.0),
-        "promo_price": st.column_config.NumberColumn("Цена акции, руб", min_value=0.0, step=1.0),
-        "cost_price": st.column_config.NumberColumn("Себестоимость, руб", min_value=0.0, step=1.0),
-        "length_cm": st.column_config.NumberColumn("Длина, см", min_value=0.0, step=0.1),
-        "width_cm": st.column_config.NumberColumn("Ширина, см", min_value=0.0, step=0.1),
-        "height_cm": st.column_config.NumberColumn("Высота, см", min_value=0.0, step=0.1),
-        "weight_kg": st.column_config.NumberColumn("Вес, кг", min_value=0.0, step=0.001),
-    },
-)
+    missing = [x for x in [
+        ("Артикул", col_sku), ("Наименование", col_name), ("Длина", col_len),
+        ("Ширина", col_wid), ("Высота", col_hei), ("Вес", col_wgt), ("Себестоимость", col_cost)
+    ] if x[1] is None]
 
-if st.button("Сохранить изменения в каталог", type="secondary"):
-    rows = []
-    for _, row in edited.iterrows():
-        rows.append(
-            (
-                clean_text(row["name"]),
-                clean_text(row["template"]),
-                clean_text(row["item_type"]),
-                clean_text(row["subcategory"]),
-                clean_text(row["category"]),
-                to_float(row["length_cm"], 0.0),
-                to_float(row["width_cm"], 0.0),
-                to_float(row["height_cm"], 0.0),
-                to_float(row["weight_kg"], 0.0),
-                to_float(row["cost_price"], 0.0),
-                to_float(row["current_price"], 0.0),
-                to_float(row["promo_price"], 0.0),
-                clean_text(row["region"]),
-                None if clean_text(row["manual_commission"]) == "" else to_float(row["manual_commission"], 0.0),
-                clean_text(row["sku"]),
-            )
-        )
-    conn.executemany(
-        """
-        UPDATE products
-        SET name=?, template=?, item_type=?, subcategory=?, category=?,
-            length_cm=?, width_cm=?, height_cm=?, weight_kg=?,
-            cost_price=?, current_price=?, promo_price=?, region=?, manual_commission=?
-        WHERE sku=?
-        """,
-        rows,
-    )
-    conn.commit()
-    st.success("Изменения сохранены.")
-    catalog_df = pd.read_sql_query("SELECT * FROM products ORDER BY sku", conn)
-
-st.markdown("### 3. Расчёт")
-
-if st.button("Рассчитать юнит-экономику", type="primary"):
-    current_catalog = pd.read_sql_query("SELECT * FROM products ORDER BY sku", conn)
+    if missing:
+        st.error("В каталоге не найдены обязательные колонки: " + ", ".join(name for name, _ in missing))
+        st.stop()
 
     results = []
-    for _, row in current_catalog.iterrows():
-        results.append(
-            calculate_unit_metrics(
-                row=row,
-                scheme=scheme,
-                tax_regime=tax_regime,
-                commission_dict=commission_dict,
-                logistics_dict=logistics_dict,
-                origin_zone=int(origin_zone),
-                acquiring_pct=acquiring_pct,
-                payout_pct=payout_pct,
-                marketing_pct=marketing_pct,
-                other_mp_pct=other_mp_pct,
-                packing_rub=packing_rub,
-                other_fixed_rub=other_fixed_rub,
-                fbo_inbound_per_unit=fbo_inbound_per_unit,
-                buyout_pct=buyout_pct,
-                client_return_pct=client_return_pct,
-                target_margin_pct=target_margin_pct,
-                round_price_step=int(round_price_step),
-                zone_shares=(share_moscow, share_spb, share_regions),
-            )
+    progress = st.progress(0)
+
+    for idx, row in catalog.iterrows():
+        sku = clean_text(row.get(col_sku, ""))
+        name = clean_text(row.get(col_name, ""))
+        length_cm = to_float(row.get(col_len, 0))
+        width_cm = to_float(row.get(col_wid, 0))
+        height_cm = to_float(row.get(col_hei, 0))
+        weight_kg = to_float(row.get(col_wgt, 0))
+        cost = to_float(row.get(col_cost, 0))
+
+        vol = volume_l(length_cm, width_cm, height_cm)
+
+        rule = detect_category_by_rules(name, rules)
+        if use_ai and openai_key:
+            ai_rule = detect_category_ai(name, rules, openai_key)
+            if ai_rule is not None:
+                rule = ai_rule
+
+        commission_pct = rule.commission_pct if rule else 0.0
+        template = rule.template if rule else "Не определено"
+        category = rule.category if rule else "Не определено"
+
+        zero_mile = get_zero_mile_cost(vol, zero_rows)
+        lm_moscow = get_last_mile_cost(vol, "Москва и МО", origin_zone, last_rows)
+        lm_spb = get_last_mile_cost(vol, "СПБ и ЛО", origin_zone, last_rows)
+        lm_regions = get_last_mile_cost(vol, "Регионы", origin_zone, last_rows)
+
+        expected_last_mile = (
+            zone_weights["Москва и МО"] * lm_moscow
+            + zone_weights["СПБ и ЛО"] * lm_spb
+            + zone_weights["Регионы"] * lm_regions
         )
 
-    result_df = pd.DataFrame(results)
+        expected_logistics = zero_mile + expected_last_mile
 
-    total_sku = len(result_df)
-    profitable_count = int((result_df["Прибыль после налога (текущая), руб"] > 0).sum())
-    loss_count = int((result_df["Прибыль после налога (текущая), руб"] <= 0).sum())
-    avg_margin = round(result_df["Маржа после налога (текущая), %"].mean(), 2) if total_sku else 0.0
-    avg_recommended_price = round(result_df["Рекоменд. цена к публикации, руб"].mean(), 2) if total_sku else 0.0
-    avg_rec_moscow = round(result_df["Рекоменд. цена Москва и МО, руб"].mean(), 2) if total_sku else 0.0
-    avg_rec_spb = round(result_df["Рекоменд. цена СПБ и ЛО, руб"].mean(), 2) if total_sku else 0.0
-    avg_rec_regions = round(result_df["Рекоменд. цена Регионы, руб"].mean(), 2) if total_sku else 0.0
+        rec_price = solve_recommended_price(
+            target_margin_pct=target_margin_pct,
+            commission_pct=commission_pct,
+            expected_logistics=expected_logistics,
+            cost=cost,
+            acquiring_pct=acquiring_pct,
+            marketing_pct=marketing_pct,
+            extra_cost=extra_cost,
+            tax_regime=tax_regime,
+            rounding_step=rounding_step,
+        )
 
-    k1, k2, k3, k4, k5 = st.columns(5)
-    k1.metric("SKU в расчёте", total_sku)
-    k2.metric("Плюсовых SKU", profitable_count)
-    k3.metric("Убыточных / нулевых SKU", loss_count)
-    k4.metric("Средняя маржа после налога, %", avg_margin)
-    k5.metric("Средняя рекоменд. цена", avg_recommended_price)
+        econ = economics_at_price(
+            price=rec_price,
+            commission_pct=commission_pct,
+            expected_logistics=expected_logistics,
+            cost=cost,
+            acquiring_pct=acquiring_pct,
+            marketing_pct=marketing_pct,
+            extra_cost=extra_cost,
+            tax_regime=tax_regime,
+        )
 
-    st.markdown("#### Средние рекомендованные цены по зонам")
-    z1, z2, z3, z4 = st.columns(4)
-    z1.metric("Москва и МО", avg_rec_moscow)
-    z2.metric("СПБ и ЛО", avg_rec_spb)
-    z3.metric("Регионы", avg_rec_regions)
-    z4.metric("Одна цена к публикации", avg_recommended_price)
+        results.append({
+            "Артикул": sku,
+            "Наименование": name,
+            "Шаблон товара": template,
+            "Категория": category,
+            "Комиссия, %": round(commission_pct, 2),
+            "Длина, см": round(length_cm, 2),
+            "Ширина, см": round(width_cm, 2),
+            "Высота, см": round(height_cm, 2),
+            "Вес, кг": round(weight_kg, 3),
+            "Объем, л": round(vol, 3),
+            "Нулевая миля, руб": round(zero_mile, 2),
+            "Последняя миля Москва/МО, руб": round(lm_moscow, 2),
+            "Последняя миля СПБ/ЛО, руб": round(lm_spb, 2),
+            "Последняя миля Регионы, руб": round(lm_regions, 2),
+            "Средняя последняя миля, руб": round(expected_last_mile, 2),
+            "Средняя логистика, руб": round(expected_logistics, 2),
+            "Себестоимость, руб": round(cost, 2),
+            "Рекомендованная цена, руб": round(rec_price, 2),
+            "Прибыль после налога, руб": round(econ["profit_after_tax"], 2),
+            "Маржа после налога, %": round(econ["margin_after_tax"], 2),
+            "Наценка, %": round(econ["markup_pct"], 2),
+        })
 
-    st.caption("Для FBS цена к публикации считается как средневзвешенная по долям зон. Для FBO значения по зонам совпадают, потому что используется единая модель входящей логистики на единицу.")
+        progress.progress((idx + 1) / max(len(catalog), 1))
 
-    def color_flags(val):
-        if val in ("Убыточно", "Нет комиссии", "Целевая маржа недостижима"):
-            return "background-color: #ffdddd"
-        if val == "Ниже цели":
-            return "background-color: #fff2cc"
-        return ""
+    progress.empty()
 
-    styled = result_df.style.applymap(color_flags, subset=["Флаг"])
-    st.dataframe(styled, use_container_width=True)
+    res_df = pd.DataFrame(results)
 
-    template_cols = [
-        "SKU",
-        "Название",
-        "Себестоимость, руб",
-        "Текущая цена, руб",
-        "Цена акции, руб",
-        "Комиссия, %",
-        "Источник комиссии",
-        "Логистика Москва и МО, руб",
-        "Логистика СПБ и ЛО, руб",
-        "Логистика Регионы, руб",
-        "Логистика итого (средняя), руб",
-        "Рекоменд. цена Москва и МО, руб",
-        "Рекоменд. цена СПБ и ЛО, руб",
-        "Рекоменд. цена Регионы, руб",
-        "Рекоменд. цена средняя, руб",
-        "Рекоменд. цена к публикации, руб",
-        "Прибыль после налога (текущая), руб",
-        "Маржа после налога (текущая), %",
-        "Флаг",
-    ]
-    notes_df = result_df[template_cols].copy()
-    notes_df["Комментарий для сотрудника"] = notes_df["Флаг"].map(
-        {
-            "Убыточно": "Проверь цену, комиссию и логистику: SKU сейчас убыточен.",
-            "Ниже цели": "SKU прибыльный, но не дотягивает до целевой маржи.",
-            "Нет комиссии": "Нужно вручную проставить категорию или комиссию.",
-            "Целевая маржа недостижима": "Переменные расходы слишком высокие для выбранной целевой маржи.",
-        }
-    ).fillna("SKU в норме.")
+    st.subheader("2. Результат")
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("SKU", len(res_df))
+    with k2:
+        st.metric("Средняя комиссия, %", round(res_df["Комиссия, %"].mean(), 2) if len(res_df) else 0)
+    with k3:
+        st.metric("Средняя логистика, руб", round(res_df["Средняя логистика, руб"].mean(), 2) if len(res_df) else 0)
+    with k4:
+        st.metric("Средняя рекомендованная цена, руб", round(res_df["Рекомендованная цена, руб"].mean(), 2) if len(res_df) else 0)
 
-    kpi_df = pd.DataFrame(
-        [
-            {"Показатель": "SKU в расчёте", "Значение": total_sku},
-            {"Показатель": "Плюсовых SKU", "Значение": profitable_count},
-            {"Показатель": "Убыточных / нулевых SKU", "Значение": loss_count},
-            {"Показатель": "Средняя маржа после налога, %", "Значение": avg_margin},
-            {"Показатель": "Средняя рекоменд. цена Москва и МО, руб", "Значение": avg_rec_moscow},
-            {"Показатель": "Средняя рекоменд. цена СПБ и ЛО, руб", "Значение": avg_rec_spb},
-            {"Показатель": "Средняя рекоменд. цена Регионы, руб", "Значение": avg_rec_regions},
-            {"Показатель": "Средняя цена к публикации, руб", "Значение": avg_recommended_price},
-            {"Показатель": "Схема", "Значение": scheme},
-            {"Показатель": "Зона откуда", "Значение": int(origin_zone)},
-        ]
-    )
+    st.dataframe(res_df, use_container_width=True, height=600)
 
-    result_xlsx = dataframe_to_excel_bytes(result_df, notes_df, kpi_df)
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        res_df.to_excel(writer, sheet_name="Результат", index=False)
     st.download_button(
-        "Скачать результат Excel (.xlsx)",
-        data=result_xlsx,
-        file_name=f"lemanpro_unit_economics_{scheme.lower()}.xlsx",
+        "Скачать результат в Excel",
+        data=output.getvalue(),
+        file_name="lemanpro_result.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    template_xlsx = dataframe_to_excel_bytes(notes_df, notes_df, kpi_df)
-    st.download_button(
-        "Скачать шаблон для сотрудников Excel (.xlsx)",
-        data=template_xlsx,
-        file_name=f"lemanpro_template_for_team_{scheme.lower()}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    with st.expander("Как считает приложение"):
+        st.markdown(
+            """
+            **Логика простая:**
+            1. По наименованию товара определяется шаблон/категория из файла комиссий.  
+            2. По габаритам считается объем в литрах.  
+            3. По объему считается:
+               - нулевая миля,
+               - последняя миля по Москве/МО,
+               - последняя миля по СПБ/ЛО,
+               - последняя миля по регионам.  
+            4. Из долей зон строится **одна средняя логистика**.  
+            5. Система подбирает **одну рекомендованную цену**, при которой достигается целевая маржа.
+            """
+        )
 else:
-    st.info("После загрузки файлов и каталога нажмите «Рассчитать юнит-экономику».")
+    st.warning("Загрузите 3 файла: каталог, комиссии, логистику.")
